@@ -6,8 +6,9 @@
       <form action="/save" method="POST" id="mainForm2">
       <input type="hidden" name="emailForm" value="1">
       <div class="card">
-        <div class="card-header">邮件通知 (SMTP)<label style="margin-left:auto;text-transform:none;font-family:var(--sans);font-size:11.5px;color:var(--fg);font-weight:500;cursor:pointer;"><input type="checkbox" name="emailEnabled" %EMAIL_EN%> 启用邮件转发</label></div>
+        <div class="card-header">邮件通知 (SMTP)</div>
         <div class="card-body">
+          <label class="switch-row" style="margin-bottom:12px;"><span class="switch-text">启用邮件转发</span><input type="checkbox" class="switch-input" name="emailEnabled" %EMAIL_EN%><span class="switch-slider"></span></label>
           <div class="form-row">
             <div class="form-group"><label class="form-label">SMTP 服务器</label><input class="form-input" type="text" name="smtpServer" value="%SMTP_SERVER%" placeholder="smtp.qq.com"></div>
             <div class="form-group"><label class="form-label">SMTP 端口</label><input class="form-input" type="number" name="smtpPort" value="%SMTP_PORT%" placeholder="465"></div>
@@ -24,8 +25,9 @@
       <form action="/save" method="POST" id="mainForm3">
       <input type="hidden" name="pushForm" value="1">
       <div class="card">
-        <div class="card-header">推送通道<label style="margin-left:auto;text-transform:none;font-family:var(--sans);font-size:11.5px;color:var(--fg);font-weight:500;cursor:pointer;"><input type="checkbox" name="pushEnabled" %PUSH_EN%> 启用推送转发</label></div>
+        <div class="card-header">推送通道</div>
         <div class="card-body">
+          <label class="switch-row" style="margin-bottom:12px;"><span class="switch-text">启用推送转发</span><input type="checkbox" class="switch-input" name="pushEnabled" %PUSH_EN%><span class="switch-slider"></span></label>
           %PUSH_CHANNELS%
           <button type="button" class="btn btn-secondary btn-block" id="addChannelBtn" onclick="addChannel()" style="margin-top:8px;">+ 添加推送通道</button>
         </div>
@@ -34,7 +36,7 @@
       </form>
       </div>
       <div>
-      <form action="/save" method="POST" id="mainForm4">
+      <form action="/save" method="POST">
       <input type="hidden" name="filterForm" value="1">
       <div class="card">
         <div class="card-header">管理员手机号</div>
@@ -45,16 +47,31 @@
           </div>
         </div>
       </div>
+      <button type="submit" class="btn btn-primary btn-block btn-save">保存管理员号码</button>
+      </form>
+      <form action="/save" method="POST">
+      <input type="hidden" name="callForm" value="1">
+      <div class="card">
+        <div class="card-header">来电通知</div>
+        <div class="card-body">
+          <label class="switch-row"><span class="switch-text">启用来电通知</span><input type="checkbox" class="switch-input" name="callNotifyEnabled" %CALLNOTIFY_CHECKED%><span class="switch-slider"></span></label>
+          <p class="form-hint">有来电时把主叫号码通过与短信相同的通道（已启用的推送 + 邮件）推送；号码被运营商隐藏时显示为未知号码。设备只通知、不接听也不回拨。黑名单号码来电不通知。</p>
+          <button type="submit" class="btn btn-primary btn-block btn-save" style="margin-top:4px;">保存来电通知</button>
+        </div>
+      </div>
+      </form>
+      <form action="/save" method="POST">
+      <input type="hidden" name="filterForm" value="1">
       <div class="card">
         <div class="card-header">号码黑名单</div>
         <div class="card-body">
           <div class="form-group">
             <textarea class="form-textarea" name="numberBlackList" rows="5" placeholder="每行一个号码">%NUMBER_BLACK_LIST%</textarea>
-            <p class="form-hint">黑名单号码发来的短信将被自动忽略</p>
+            <p class="form-hint">黑名单号码发来的短信和来电将被自动忽略</p>
           </div>
         </div>
       </div>
-      <button type="submit" class="btn btn-primary btn-block btn-save">保存权限与过滤</button>
+      <button type="submit" class="btn btn-primary btn-block btn-save">保存号码黑名单</button>
       </form>
       <form action="/save" method="POST" onsubmit="serializeRules()">
         <input type="hidden" name="rulesForm" value="1">

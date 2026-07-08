@@ -9,7 +9,7 @@
 #include "esp_err.h"
 
 static constexpr int IDF_MAX_PUSH_CHANNELS = 5;
-static constexpr const char* IDF_FW_VERSION = "1.0.6";
+static constexpr const char* IDF_FW_VERSION = "1.0.7";
 static constexpr const char* IDF_DEFAULT_WEB_USER = "admin";
 static constexpr const char* IDF_DEFAULT_WEB_PASS = "admin123";
 static constexpr const char* IDF_KEEPALIVE_DEFAULT_URL = "http://gg.incrafttime.top/api/payload?size=64342";
@@ -74,6 +74,7 @@ struct IdfConfig {
     int hbHour = 9;
 
     bool netLedEnabled = true;  // 模组 NET 指示灯(AT+MNETLIGHT)，关闭后重启依然保持
+    bool callNotifyEnabled = true;  // 来电通知：有来电时把主叫号码按短信相同的通道推送
     bool dataEnabled = false;
     bool roamingEnabled = true;  // 允许数据漫游(同手机"数据漫游")：关闭后漫游中不激活蜂窝数据
     std::string apn;
@@ -111,6 +112,7 @@ esp_err_t idf_config_factory_reset(void);
 esp_err_t idf_config_set_keepalive_last(uint32_t epoch);
 esp_err_t idf_config_set_sched_last(int index, uint32_t epoch);
 esp_err_t idf_config_set_net_led_enabled(bool enabled);
+esp_err_t idf_config_set_call_notify_enabled(bool enabled);
 
 // /status 高频轮询(2s)专用窄快照：只拷贝状态页用到的字段，
 // 避免每次请求做全量配置深拷贝造成持续堆抖动
@@ -155,6 +157,7 @@ struct IdfConfigWebView {
     std::string operatorPlmn;
     std::string kaProfile;
     bool netLedEnabled = true;
+    bool callNotifyEnabled = true;
     IdfPushChannel pushChannels[IDF_MAX_PUSH_CHANNELS];
 };
 
@@ -274,6 +277,7 @@ bool idf_config_email_configured(void);
 bool idf_config_check_web_auth(const char* user, const char* pass);
 // 模组初始化只需这一个开关，锁内求值避免在模组任务栈上放全量配置副本
 bool idf_config_net_led_enabled(void);
+bool idf_config_call_notify_enabled(void);
 // 时区/NTP 窄访问器：给运行在小栈任务(tiT/lwip、系统事件)的 SNTP 回调用，
 // 避免深拷贝整个 IdfConfig 到小栈上导致爆栈
 int idf_config_get_tz_offset(void);

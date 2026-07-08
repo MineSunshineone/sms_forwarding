@@ -149,6 +149,8 @@
     .switch-input:checked + .switch-slider { background: #2f81f7; }
     .switch-input:checked + .switch-slider::before { transform: translateX(18px); }
     .switch-input:focus-visible + .switch-slider { outline: 2px solid #2f81f7; outline-offset: 2px; }
+    /* 行内开关：用于卡片标题/表单行里替代原生复选框，与 switch-row 视觉一致 */
+    .switch-inline { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
     .schedule-status { margin: 12px 0 13px; padding: 9px 10px; background: var(--canvas-soft); border: 1px solid var(--hairline); border-left: 2px solid var(--amber); color: var(--body); font-family: var(--mono); font-size: 11.5px; line-height: 1.5; }
     .schedule-grid .form-row { gap: 12px; }
     .schedule-grid .form-row .form-group { min-width: 0; }

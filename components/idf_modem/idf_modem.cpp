@@ -43,6 +43,7 @@ static constexpr uint32_t IDENTITY_RETRY_INTERVAL_MS = 600000UL;
 // 采样仍受 at_channel_idle 门控，不与收发/保号抢 AT 通道
 static constexpr uint32_t SIGNAL_INTERVAL_WEB_MS = 10000UL;
 static constexpr uint32_t SIGNAL_DETAIL_INTERVAL_WEB_MS = 30000UL;
+static constexpr uint32_t SIM_CHECK_INTERVAL_MS = 15000UL;  // SIM 热插拔检测轮询间隔
 static constexpr int64_t WEB_POLL_ACTIVE_WINDOW_US = 15LL * 1000LL * 1000LL;
 static constexpr size_t URC_BUFFER_MAX = 4096;
 
@@ -1683,9 +1684,22 @@ static void configure_sms_and_registration(void)
     }
     send_ok("AT+CNMI=2,1,0,0,0", 1200);
     send_ok("AT+CEREG=2", 1200);
+    // 开启主叫号码上报：来电时模组主动上报 RING + +CLIP: "号码",...，供来电通知使用。
+    // 无语音能力的卡/模组下该指令可能 ERROR，忽略即可(收不到来电就不会有 URC)。
+    send_ok("AT+CLIP=1", 1200);
     // NET 指示灯开关(ML307R: AT+MLED=0,<0/1>)：每次初始化按保存的配置下发，
     // 覆盖模组记住的上次状态
     send_ok(idf_config_net_led_enabled() ? "AT+MLED=0,1" : "AT+MLED=0,0", 1200);
+}
+
+// 查询 SIM 是否就绪：AT+CPIN? 返回 +CPIN: READY 视为有卡可用；无卡/卡故障时模组回
+// +CME ERROR(10=无卡,13=卡故障)，send_ok 返回 false。用于运行中热插拔检测。
+static bool query_sim_ready(void)
+{
+    std::string resp;
+    if (!send_ok("AT+CPIN?", 1500, &resp)) return false;
+    return resp.find("+CPIN: READY") != std::string::npos ||
+           resp.find("+CPIN:READY") != std::string::npos;
 }
 
 // 重启后 AT 握手失败时置位：一旦后续任何探测发现 AT 恢复，立即补跑完整初始化
@@ -1850,6 +1864,8 @@ static void modem_task(void*)
     TickType_t last_health = 0;
     int health_fail_count = 0;
     int dereg_count = 0;
+    TickType_t last_sim_check = 0;
+    int sim_present = -1;  // -1=未知(仅记基线) 0=无卡 1=有卡
     while (true) {
         handle_reset_request_if_any();
         run_pending_reinit_if_recovered();
@@ -1932,6 +1948,35 @@ static void modem_task(void*)
                 health_fail_count = 0;
                 idf_log_line("模组健康探测连续失败，触发硬重启恢复");
                 s_reset_request.store(2, std::memory_order_relaxed);
+            }
+        }
+        // SIM 热插拔检测：低频轮询 AT+CPIN?，识别运行中插卡/拔卡。
+        // 插入(无卡→有卡)：重跑短信/网络配置 + 作废旧身份触发重采样，让新卡自动初始化；
+        // 拔出(有卡→无卡)：标记未就绪并清空身份，避免概览沿用旧卡信息。
+        if ((last_sim_check == 0 || now - last_sim_check > pdMS_TO_TICKS(SIM_CHECK_INTERVAL_MS)) &&
+            at_channel_idle_now()) {
+            last_sim_check = now;
+            int present_now = query_sim_ready() ? 1 : 0;
+            if (sim_present == -1) {
+                sim_present = present_now;  // 首次仅记基线，不当作插拔事件
+            } else if (present_now != sim_present) {
+                sim_present = present_now;
+                if (present_now == 1) {
+                    idf_log_line("检测到 SIM 卡插入，重新初始化模组");
+                    configure_sms_and_registration();
+                    idf_modem_invalidate_sim_identity();
+                    registered = false;
+                    post_register_done = false;
+                    dereg_count = 0;
+                    last_health = 0;  // 下一轮立即重查 CEREG，尽快感知新卡注册
+                    set_phase("registering");
+                } else {
+                    idf_log_line("检测到 SIM 卡移除");
+                    registered = false;
+                    post_register_done = false;
+                    idf_modem_invalidate_sim_identity();
+                    set_phase("registering");
+                }
             }
         }
         for (int i = 0; i < 10; ++i) {

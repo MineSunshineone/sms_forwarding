@@ -95,7 +95,7 @@
         var folded = !en;
         html += '<div class="push-channel' + (en ? ' enabled' : '') + (folded ? ' folded' : '') + (configured ? ' configured' : '') + '" id="channel' + idx + '" data-configured="' + (configured ? '1' : '0') + '">';
         html += '<div class="push-channel-header">';
-        html += '<input type="checkbox" name="push' + idx + 'en" id="push' + idx + 'en" onchange="toggleChannel(' + idx + ')"' + (en ? ' checked' : '') + '>';
+        html += '<input type="checkbox" class="switch-input" name="push' + idx + 'en" id="push' + idx + 'en" onchange="toggleChannel(' + idx + ')"' + (en ? ' checked' : '') + '><span class="switch-slider"></span>';
         html += '<label for="push' + idx + 'en" class="label-inline">启用推送通道 ' + (i + 1) + '</label>';
         html += '<span class="ch-summary" id="chsum' + idx + '"></span>';
         html += '<button type="button" class="channel-fold" onclick="toggleChannelBody(' + idx + ')" id="foldBtn' + idx + '">展开</button>';
@@ -143,7 +143,7 @@
         DATA_CHECKED: checked(c.dataEnabled), ROAMING_CHECKED: checked(c.roamingEnabled !== false),
         APN: htmlEsc(c.apn || ''), PHONE_NUMBER: htmlEsc(c.phoneNumber || ''),
         OPERATOR_PLMN: htmlEsc(c.operatorPlmn || ''), KA_PROFILE: htmlEsc(c.kaProfile || ''), PUSH_CHANNELS: buildPushChannels(c.pushChannels),
-        NETLED_CHECKED: checked(c.netLedEnabled !== false), UPTIME: htmlEsc(c.uptimeText || '')
+        NETLED_CHECKED: checked(c.netLedEnabled !== false), CALLNOTIFY_CHECKED: checked(c.callNotifyEnabled !== false), UPTIME: htmlEsc(c.uptimeText || '')
       };
       return html.replace(/%([A-Z0-9_]{2,})%/g, function(m, k){ return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : m; });
     }
@@ -926,7 +926,7 @@
       card.style.display = 'none';
       card.innerHTML =
         '<div class="push-channel-header">' +
-          '<input type="checkbox" name="st' + i + 'En" id="st' + i + 'En" onchange="stSyncHead(' + i + ')">' +
+          '<input type="checkbox" class="switch-input" name="st' + i + 'En" id="st' + i + 'En" onchange="stSyncHead(' + i + ')"><span class="switch-slider"></span>' +
           '<label for="st' + i + 'En" class="label-inline">启用任务 ' + (i + 1) + '</label>' +
           '<span class="ch-summary" id="st' + i + 'Sum"></span>' +
           '<span class="schedule-tag" id="st' + i + 'Countdown" style="margin-left:auto;">--</span>' +

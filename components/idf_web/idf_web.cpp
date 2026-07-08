@@ -516,6 +516,9 @@ static esp_err_t send_config_json(httpd_req_t* req)
     body += "\"netLedEnabled\":";
     body += cfg.netLedEnabled ? "true" : "false";
     body += ",";
+    body += "\"callNotifyEnabled\":";
+    body += cfg.callNotifyEnabled ? "true" : "false";
+    body += ",";
     body += "\"pushChannels\":[";
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         if (i) body += ",";
@@ -1257,12 +1260,13 @@ static esp_err_t handle_save(httpd_req_t* req)
     const bool st_form = has_field(fields, "stForm");
     const bool system_sched_form = has_field(fields, "systemSchedForm");
     const bool sim_form = has_field(fields, "simForm");
+    const bool call_form = has_field(fields, "callForm");
     const int form_count = (account_form ? 1 : 0) + (tz_form ? 1 : 0) +
                            (led_form ? 1 : 0) + (email_form ? 1 : 0) +
                            (push_form ? 1 : 0) + (filter_form ? 1 : 0) +
                            (rules_form ? 1 : 0) + (ka_form ? 1 : 0) +
                            (st_form ? 1 : 0) + (system_sched_form ? 1 : 0) +
-                           (sim_form ? 1 : 0);
+                           (sim_form ? 1 : 0) + (call_form ? 1 : 0);
     if (form_count != 1) {
         idf_log_line(form_count == 0 ? "网页保存请求缺少表单标记，已忽略"
                                      : "网页保存请求包含多个表单标记，已拒绝");
@@ -1312,6 +1316,17 @@ static esp_err_t handle_save(httpd_req_t* req)
         return ESP_OK;
     }
 
+    if (call_form) {
+        bool enabled = has_field(fields, "callNotifyEnabled");
+        esp_err_t err = idf_config_set_call_notify_enabled(enabled);
+        if (err != ESP_OK) return fail(err);
+        httpd_resp_set_type(req, "text/plain");
+        set_no_cache_headers(req);
+        httpd_resp_sendstr(req, "OK");
+        idf_logf("网页保存来电通知配置: %s", enabled ? "开启" : "关闭");
+        return ESP_OK;
+    }
+
     if (email_form) {
         std::string smtp_pass = field_text(fields, "smtpPass");
         bool preserve_smtp_pass = field_blank(smtp_pass);
@@ -1336,8 +1351,14 @@ static esp_err_t handle_save(httpd_req_t* req)
     }
 
     if (filter_form) {
-        esp_err_t err = idf_config_save_filter(field_text(fields, "adminPhone"),
-                                               field_text(fields, "numberBlackList"));
+        // 管理员号码与黑名单已拆成两个独立表单，各自只提交自己的字段：
+        // 本次未提交的字段读当前值保留，避免只存其一时把另一个清空。
+        IdfConfigWebView cur = idf_config_get_web_view();
+        std::string admin = has_field(fields, "adminPhone")
+                                ? field_text(fields, "adminPhone") : cur.adminPhone;
+        std::string blacklist = has_field(fields, "numberBlackList")
+                                    ? field_text(fields, "numberBlackList") : cur.numberBlackList;
+        esp_err_t err = idf_config_save_filter(admin, blacklist);
         if (err != ESP_OK) return fail(err);
         return ok("网页保存权限与过滤");
     }
