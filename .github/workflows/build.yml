@@ -56,6 +56,7 @@ jobs:
           esptool.py --chip esp32c3 merge_bin -o "dist/sms_forwarder_full_v${V}.bin" \
             0x0 build/idf/bootloader/bootloader.bin \
             0x8000 build/idf/partition_table/partition-table.bin \
+            0xe000 build/idf/ota_data_initial.bin \
             0x10000 build/idf/sms_forwarding_idf.bin
           ls -l dist/
 
