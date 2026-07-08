@@ -42,6 +42,8 @@ struct IdfPushChannel {
 struct IdfConfig {
     std::string wifiSsid;
     std::string wifiPass;
+    std::string wifiSsid2;
+    std::string wifiPass2;
     bool wifiFromFallback = false;
 
     std::string smtpServer;
@@ -89,7 +91,8 @@ using IdfFormFields = std::vector<std::pair<std::string, std::string>>;
 
 esp_err_t idf_config_load(void);
 esp_err_t idf_config_save(void);
-esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass);
+esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass,
+                               const std::string& ssid2, const std::string& pass2);
 esp_err_t idf_config_save_account(const std::string& user, const std::string& pass);
 esp_err_t idf_config_save_time(int tz_offset_min, const std::string& ntp_server);
 esp_err_t idf_config_save_email(bool enabled, const std::string& server, int port,
@@ -130,6 +133,8 @@ struct IdfConfigStatusView {
 
 // /config.json 专用快照：不带定时任务数组，避免面板切换/保存后刷新时全量深拷贝
 struct IdfConfigWebView {
+    std::string wifiSsid;
+    std::string wifiSsid2;
     std::string webUser = IDF_DEFAULT_WEB_USER;
     std::string webPass = IDF_DEFAULT_WEB_PASS;
     std::string smtpServer;

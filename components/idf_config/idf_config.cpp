@@ -150,6 +150,8 @@ static void normalize_config(IdfConfig& c)
 {
     limit_utf8_bytes(c.wifiSsid, 64);
     limit_utf8_bytes(c.wifiPass, 128);
+    limit_utf8_bytes(c.wifiSsid2, 64);
+    limit_utf8_bytes(c.wifiPass2, 128);
     limit_utf8_bytes(c.smtpServer, 128);
     c.smtpPort = (c.smtpPort > 0 && c.smtpPort <= 65535) ? c.smtpPort : 465;
     limit_utf8_bytes(c.smtpUser, 128);
@@ -346,6 +348,8 @@ esp_err_t idf_config_load(void)
     if (err == ESP_OK) {
         next.wifiSsid = read_str(nvs, "wifiSsid", "", 64);
         next.wifiPass = read_str(nvs, "wifiPass", "", 128);
+        next.wifiSsid2 = read_str(nvs, "wifiSsid2", "", 64);
+        next.wifiPass2 = read_str(nvs, "wifiPass2", "", 128);
         next.smtpServer = read_str(nvs, "smtpServer", "", 128);
         next.smtpPort = read_i32(nvs, "smtpPort", 465);
         next.smtpUser = read_str(nvs, "smtpUser", "", 128);
@@ -462,6 +466,8 @@ std::string idf_config_export_text(void)
 
     append_kv(out, "wifiSsid", c.wifiSsid);
     append_kv(out, "wifiPass", c.wifiPass);
+    append_kv(out, "wifiSsid2", c.wifiSsid2);
+    append_kv(out, "wifiPass2", c.wifiPass2);
     append_kv(out, "smtpServer", c.smtpServer);
     append_kv_i(out, "smtpPort", c.smtpPort);
     append_kv(out, "smtpUser", c.smtpUser);
@@ -546,6 +552,8 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
 {
     if (key == "wifiSsid") c.wifiSsid = value;
     else if (key == "wifiPass") c.wifiPass = value;
+    else if (key == "wifiSsid2") c.wifiSsid2 = value;
+    else if (key == "wifiPass2") c.wifiPass2 = value;
     else if (key == "smtpServer") c.smtpServer = value;
     else if (key == "smtpPort") import_int_field(c.smtpPort, value);
     else if (key == "smtpUser") c.smtpUser = value;
@@ -796,6 +804,8 @@ static esp_err_t save_config_to_nvs(const IdfConfig& c)
     err = ESP_OK;
     if (err == ESP_OK) err = write_str(nvs, "wifiSsid", c.wifiSsid);
     if (err == ESP_OK) err = write_str(nvs, "wifiPass", c.wifiPass);
+    if (err == ESP_OK) err = write_str(nvs, "wifiSsid2", c.wifiSsid2);
+    if (err == ESP_OK) err = write_str(nvs, "wifiPass2", c.wifiPass2);
     if (err == ESP_OK) err = write_str(nvs, "smtpServer", c.smtpServer);
     if (err == ESP_OK) err = nvs_set_i32(nvs, "smtpPort", c.smtpPort);
     if (err == ESP_OK) err = write_str(nvs, "smtpUser", c.smtpUser);
@@ -948,24 +958,36 @@ esp_err_t idf_config_save(void)
     return err;
 }
 
-esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass)
+esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass,
+                               const std::string& ssid2, const std::string& pass2)
 {
-    if (ssid.empty() || ssid.size() > 32 || pass.size() > 64) return ESP_ERR_INVALID_ARG;
+    if ((ssid.empty() && ssid2.empty()) || ssid.size() > 32 || ssid2.size() > 32 ||
+        pass.size() > 64 || pass2.size() > 64) {
+        return ESP_ERR_INVALID_ARG;
+    }
     std::string next_ssid = ssid;
     std::string next_pass = pass;
+    std::string next_ssid2 = ssid2;
+    std::string next_pass2 = pass2;
     limit_utf8_bytes(next_ssid, 64);
     limit_utf8_bytes(next_pass, 128);
+    limit_utf8_bytes(next_ssid2, 64);
+    limit_utf8_bytes(next_pass2, 128);
 
     nvs_handle_t nvs = 0;
     esp_err_t err = begin_field_save(&nvs);
     if (err != ESP_OK) return err;
     if (err == ESP_OK) err = write_str(nvs, "wifiSsid", next_ssid);
     if (err == ESP_OK) err = write_str(nvs, "wifiPass", next_pass);
+    if (err == ESP_OK) err = write_str(nvs, "wifiSsid2", next_ssid2);
+    if (err == ESP_OK) err = write_str(nvs, "wifiPass2", next_pass2);
     err = commit_field_save(nvs, err, "WiFi 配置");
     if (err == ESP_OK) {
         xSemaphoreTake(s_config_mutex, portMAX_DELAY);
         s_config.wifiSsid = next_ssid;
         s_config.wifiPass = next_pass;
+        s_config.wifiSsid2 = next_ssid2;
+        s_config.wifiPass2 = next_pass2;
         s_config.wifiFromFallback = false;
         xSemaphoreGive(s_config_mutex);
     }
@@ -1391,6 +1413,8 @@ IdfConfigWebView idf_config_get_web_view(void)
     IdfConfigWebView view;
     if (ensure_config_mutex() != ESP_OK) return view;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    view.wifiSsid = s_config.wifiSsid;
+    view.wifiSsid2 = s_config.wifiSsid2;
     view.webUser = s_config.webUser;
     view.webPass = s_config.webPass;
     view.smtpServer = s_config.smtpServer;
@@ -1594,7 +1618,7 @@ bool idf_config_has_sta_credentials(void)
 {
     if (ensure_config_mutex() != ESP_OK) return false;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    bool ok = !s_config.wifiSsid.empty();
+    bool ok = !s_config.wifiSsid.empty() || !s_config.wifiSsid2.empty();
     xSemaphoreGive(s_config_mutex);
     return ok;
 }

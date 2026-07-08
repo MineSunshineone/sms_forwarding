@@ -54,10 +54,14 @@
           <div class="card-header">WiFi 网络<button class="btn btn-secondary btn-sm" style="margin-left:auto;" onclick="wifiScan()">扫描</button></div>
           <div class="card-body">
             <div class="form-group"><label class="form-label">选择网络</label><select class="form-select" id="wifiScanSel" onchange="wifiPick()"><option value="">点“扫描”获取周边 WiFi</option></select></div>
-            <div class="form-group"><label class="form-label">WiFi 名称 (SSID)</label><input class="form-input" type="text" id="wifiSsidIn" placeholder="从上方选择或手动输入"></div>
-            <div class="form-group"><label class="form-label">WiFi 密码</label><input class="form-input" type="password" id="wifiPassIn" placeholder="开放网络留空"></div>
+            <div class="form-grid two">
+              <div class="form-group"><label class="form-label">WiFi 1 名称 (SSID)</label><input class="form-input" type="text" id="wifiSsidIn" onfocus="wifiSetPickTarget(1)" placeholder="优先连接"></div>
+              <div class="form-group"><label class="form-label">WiFi 1 密码</label><input class="form-input" type="password" id="wifiPassIn" placeholder="开放网络留空"></div>
+              <div class="form-group"><label class="form-label">WiFi 2 名称 (SSID)</label><input class="form-input" type="text" id="wifiSsid2In" onfocus="wifiSetPickTarget(2)" placeholder="WiFi 1 失败后尝试"></div>
+              <div class="form-group"><label class="form-label">WiFi 2 密码</label><input class="form-input" type="password" id="wifiPass2In" placeholder="开放网络留空"></div>
+            </div>
             <div class="btn-row"><button class="btn btn-primary" onclick="wifiSave()">保存并重启接入</button><button class="btn btn-secondary" onclick="wifiRestart()">重连当前网络</button></div>
-            <p class="form-hint">保存后设备重启接入新网络；若连接失败会自动重开配网热点供你重配</p>
+            <p class="form-hint">保存后设备重启，先尝试 WiFi 1，失败后尝试 WiFi 2；全部失败才会自动重开配网热点</p>
             <div class="result-box" id="wifiCfgResult"></div>
             <div class="result-box" id="wifiResult"></div>
           </div>

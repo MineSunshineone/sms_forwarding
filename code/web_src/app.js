@@ -1588,6 +1588,10 @@
     }
 
     // ---- WiFi settings ----
+    var wifiPickTarget = 1;
+    function wifiSetPickTarget(slot) {
+      wifiPickTarget = slot === 2 ? 2 : 1;
+    }
     function wifiScan() {
       var sel = document.getElementById('wifiScanSel');
       sel.innerHTML = '<option value="">扫描中（约 3 秒）...</option>';
@@ -1605,20 +1609,35 @@
     }
     function wifiPick() {
       var v = document.getElementById('wifiScanSel').value;
-      if (v) { document.getElementById('wifiSsidIn').value = v; document.getElementById('wifiPassIn').focus(); }
+      if (!v) return;
+      var ssidIn = document.getElementById(wifiPickTarget === 2 ? 'wifiSsid2In' : 'wifiSsidIn');
+      var passIn = document.getElementById(wifiPickTarget === 2 ? 'wifiPass2In' : 'wifiPassIn');
+      if (ssidIn) ssidIn.value = v;
+      if (passIn) passIn.focus();
     }
     function wifiSave() {
       var s = document.getElementById('wifiSsidIn').value.trim();
-      if (!s) { alert('请输入 WiFi 名称'); return; }
-      if (!confirm('保存并重启接入 “' + s + '”？设备将重启约 15-20 秒。')) return;
+      var s2 = document.getElementById('wifiSsid2In').value.trim();
+      if (!s && !s2) { alert('请至少输入一组 WiFi 名称'); return; }
+      var names = s && s2 ? (s + ' / ' + s2) : (s || s2);
+      if (!confirm('保存并重启接入 “' + names + '”？设备将重启约 15-20 秒。')) return;
       var r = document.getElementById('wifiCfgResult');
       r.className = 'result-box result-loading'; r.textContent = '保存中，设备即将重启...';
-      var body = 'ssid=' + encodeURIComponent(s) + '&pass=' + encodeURIComponent(document.getElementById('wifiPassIn').value);
+      var body = 'ssid=' + encodeURIComponent(s) +
+                 '&pass=' + encodeURIComponent(document.getElementById('wifiPassIn').value) +
+                 '&ssid2=' + encodeURIComponent(s2) +
+                 '&pass2=' + encodeURIComponent(document.getElementById('wifiPass2In').value);
       fetch('/wificonfig', {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body}).then(jsonOrThrow).then(function(d) {
         r.className = 'result-box ' + (d.success ? 'result-success' : 'result-error'); r.textContent = d.message;
       }).catch(function(){ r.className = 'result-box result-info'; r.textContent = '设备正在重启，请连接目标 WiFi 后重新访问设备'; });
     }
     function wifiPrefill() {
+      ensureConfig(false).then(function(cfg) {
+        var ssidIn = document.getElementById('wifiSsidIn');
+        var ssid2In = document.getElementById('wifiSsid2In');
+        if (ssidIn && cfg.wifiSsid && !ssidIn.value) ssidIn.value = cfg.wifiSsid;
+        if (ssid2In && cfg.wifiSsid2 && !ssid2In.value) ssid2In.value = cfg.wifiSsid2;
+      }).catch(function(){});
       fetch('/status?_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d) {
         var ssidIn = document.getElementById('wifiSsidIn');
         if (ssidIn && d.ssid && !d.apMode && !ssidIn.value) ssidIn.value = d.ssid;
