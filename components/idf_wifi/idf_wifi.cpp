@@ -33,6 +33,7 @@ static const char* TAG = "idf_wifi";
 static constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
 static constexpr EventBits_t WIFI_FAIL_BIT = BIT1;
 static constexpr int WIFI_CONNECT_TIMEOUT_MS = 20000;
+static constexpr int WIFI_FAILOVER_OFFLINE_MS = 30000;
 static constexpr const char* AP_SSID_PREFIX = "SMS-Forwarder-";
 static constexpr gpio_num_t PROVISION_BUTTON_PIN = GPIO_NUM_9;
 static constexpr uint32_t PROVISION_BUTTON_HOLD_MS = 5000;
@@ -66,6 +67,7 @@ static constexpr uint32_t AP_PROVISION_HOLD_MS = 20000;  // 连上后保留热�
 static esp_err_t start_provisioning_ap(bool manual = false);
 static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event_id, void* event_data);
 static void schedule_ap_close(uint32_t delay_ms);
+static bool schedule_sta_failover(const char* reason);
 
 struct StaCredential {
     std::string ssid;
@@ -73,6 +75,12 @@ struct StaCredential {
     int index = 1;
     bool fallback = false;
 };
+
+static std::vector<StaCredential> s_sta_candidates;
+static std::atomic<int> s_current_candidate_index{0};
+static std::atomic<int64_t> s_offline_since_us{0};
+static std::atomic<int> s_failover_attempts_in_round{0};
+static std::atomic<bool> s_failover_task_running{false};
 
 struct ApState {
     bool mode = false;
@@ -151,6 +159,41 @@ static std::vector<StaCredential> build_sta_candidates(const IdfConfig& config)
     return candidates;
 }
 
+static int find_sta_candidate_index(const StaCredential& cred)
+{
+    for (size_t i = 0; i < s_sta_candidates.size(); ++i) {
+        const StaCredential& item = s_sta_candidates[i];
+        if (item.index == cred.index && item.ssid == cred.ssid) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+static void note_sta_candidate_started(const StaCredential& cred)
+{
+    int pos = find_sta_candidate_index(cred);
+    if (pos >= 0) s_current_candidate_index.store(pos, std::memory_order_relaxed);
+}
+
+static int next_sta_candidate_index(void)
+{
+    size_t count = s_sta_candidates.size();
+    if (count < 2) return -1;
+    int current = s_current_candidate_index.load(std::memory_order_relaxed);
+    if (current < 0 || current >= static_cast<int>(count)) current = 0;
+    return (current + 1) % static_cast<int>(count);
+}
+
+static bool sta_failover_still_needed(void)
+{
+    if (s_sta_connected.load(std::memory_order_relaxed)) return false;
+    int64_t offline_since = s_offline_since_us.load(std::memory_order_relaxed);
+    if (offline_since <= 0) return false;
+    return esp_timer_get_time() - offline_since >=
+           static_cast<int64_t>(WIFI_FAILOVER_OFFLINE_MS) * 1000LL;
+}
+
 static std::string format_epoch_local(time_t epoch, int tz_offset_min)
 {
     if (epoch < 1700000000) return {};
@@ -197,6 +240,11 @@ static void cleanup_wifi_start_resources(bool wifi_inited,
     s_has_sta_credentials.store(false, std::memory_order_relaxed);
     s_sta_configured.store(false, std::memory_order_relaxed);
     s_sta_connected.store(false, std::memory_order_relaxed);
+    s_sta_candidates.clear();
+    s_current_candidate_index.store(0, std::memory_order_relaxed);
+    s_offline_since_us.store(0, std::memory_order_relaxed);
+    s_failover_attempts_in_round.store(0, std::memory_order_relaxed);
+    s_failover_task_running.store(false, std::memory_order_relaxed);
 }
 
 static void sntp_sync_cb(timeval*)
@@ -336,6 +384,10 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
     }
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_sta_connected.store(false, std::memory_order_relaxed);
+        int64_t now_us = esp_timer_get_time();
+        int64_t expected = 0;
+        s_offline_since_us.compare_exchange_strong(
+            expected, now_us, std::memory_order_relaxed, std::memory_order_relaxed);
         if (s_wifi_event_group) {
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
@@ -360,6 +412,8 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
         auto* event = static_cast<ip_event_got_ip_t*>(event_data);
         s_sta_connected.store(true, std::memory_order_relaxed);
         s_disconnect_streak.store(0, std::memory_order_relaxed);
+        s_offline_since_us.store(0, std::memory_order_relaxed);
+        s_failover_attempts_in_round.store(0, std::memory_order_relaxed);
         ESP_LOGI(TAG, "STA 已获取 IP: " IPSTR, IP2STR(&event->ip_info.ip));
         if (!s_suppress_next_connect_log.exchange(false, std::memory_order_relaxed)) {
             idf_logf("WiFi 已连接，IP=" IPSTR, IP2STR(&event->ip_info.ip));
@@ -395,7 +449,20 @@ static void reconnect_watchdog_cb(void*)
     static uint32_t tick = 0;  // esp_timer 回调串行执行，无并发
     ++tick;
     // 配网热点开启时降频到 60s：连接尝试会把 STA 拉去跑信道，影响 AP 客户端与扫描
-    if (ap_state_snapshot().mode && (tick % 4) != 0) return;
+    ApState ap = ap_state_snapshot();
+    if (ap.mode && (tick % 4) != 0) return;
+    int64_t now_us = esp_timer_get_time();
+    int64_t offline_since = s_offline_since_us.load(std::memory_order_relaxed);
+    if (offline_since <= 0) {
+        int64_t expected = offline_since;
+        s_offline_since_us.compare_exchange_strong(
+            expected, now_us, std::memory_order_relaxed, std::memory_order_relaxed);
+        offline_since = now_us;
+    }
+    if (now_us - offline_since >= static_cast<int64_t>(WIFI_FAILOVER_OFFLINE_MS) * 1000LL &&
+        schedule_sta_failover("离线超过30秒")) {
+        return;
+    }
     esp_err_t err = esp_wifi_connect();
     if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
         ESP_LOGW(TAG, "看门狗重连发起失败: %s", esp_err_to_name(err));
@@ -870,6 +937,7 @@ static void provision_button_task(void*)
 // 这样 app_main 不再被首连阻塞，Web/推送/模组/短信与 WiFi 连接并行启动。
 static esp_err_t connect_sta_begin(const StaCredential& cred, bool disconnect_first)
 {
+    bool was_configured = s_sta_configured.load(std::memory_order_relaxed);
     s_sta_configured.store(false, std::memory_order_relaxed);
     if (disconnect_first) {
         esp_err_t disc_err = esp_wifi_disconnect();
@@ -888,15 +956,88 @@ static esp_err_t connect_sta_begin(const StaCredential& cred, bool disconnect_fi
     sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
 
     esp_err_t err = esp_wifi_set_mode(ap_state_snapshot().mode ? WIFI_MODE_APSTA : WIFI_MODE_STA);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        s_sta_configured.store(was_configured, std::memory_order_relaxed);
+        return err;
+    }
     err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        s_sta_configured.store(was_configured, std::memory_order_relaxed);
+        return err;
+    }
     s_sta_configured.store(true, std::memory_order_relaxed);
     err = esp_wifi_connect();
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        s_sta_configured.store(was_configured, std::memory_order_relaxed);
+        return err;
+    }
+    note_sta_candidate_started(cred);
     ESP_LOGI(TAG, "连接 WiFi %d: %s%s", cred.index, cred.ssid.c_str(), cred.fallback ? " (fallback)" : "");
     idf_logf("连接 WiFi %d: %s%s", cred.index, cred.ssid.c_str(), cred.fallback ? " (fallback)" : "");
     return ESP_OK;
+}
+
+static void failover_switch_task(void* arg)
+{
+    int* target_arg = static_cast<int*>(arg);
+    int target = target_arg ? *target_arg : -1;
+    delete target_arg;
+
+    if (!sta_failover_still_needed()) {
+        s_failover_task_running.store(false, std::memory_order_relaxed);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    if (target >= 0 && target < static_cast<int>(s_sta_candidates.size())) {
+        int attempt = s_failover_attempts_in_round.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (attempt >= static_cast<int>(s_sta_candidates.size())) {
+            if (!ap_state_snapshot().mode) {
+                idf_log_line("两组 WiFi 均已尝试失败，开启配网热点");
+                ESP_ERROR_CHECK_WITHOUT_ABORT(start_provisioning_ap(false));
+            }
+            s_failover_attempts_in_round.store(0, std::memory_order_relaxed);
+        }
+
+        const StaCredential cred = s_sta_candidates[target];
+        idf_logf("WiFi 离线超过30秒，切换到 WiFi %d 重试", cred.index);
+        esp_err_t err = connect_sta_begin(cred, true);
+        if (err == ESP_OK) {
+            s_offline_since_us.store(esp_timer_get_time(), std::memory_order_relaxed);
+        } else {
+            idf_logf("切换到 WiFi %d 失败: %s", cred.index, esp_err_to_name(err));
+        }
+    }
+
+    s_failover_task_running.store(false, std::memory_order_relaxed);
+    vTaskDelete(nullptr);
+}
+
+static bool schedule_sta_failover(const char* reason)
+{
+    int target = next_sta_candidate_index();
+    if (target < 0) return false;
+
+    bool expected = false;
+    if (!s_failover_task_running.compare_exchange_strong(
+            expected, true, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        return true;
+    }
+
+    int* arg = new (std::nothrow) int(target);
+    if (!arg) {
+        s_failover_task_running.store(false, std::memory_order_relaxed);
+        return false;
+    }
+
+    BaseType_t ok = xTaskCreate(failover_switch_task, "wifi_failover", 4096, arg, 2, nullptr);
+    if (ok != pdPASS) {
+        delete arg;
+        s_failover_task_running.store(false, std::memory_order_relaxed);
+        ESP_LOGW(TAG, "WiFi 故障转移任务创建失败: %s", reason ? reason : "unknown");
+        return false;
+    }
+    return true;
 }
 
 static bool sta_wait_connect_result(const StaCredential& cred)
@@ -954,6 +1095,11 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
         return ESP_ERR_NO_MEM;
     }
     std::vector<StaCredential> candidates = build_sta_candidates(config);
+    s_sta_candidates = candidates;
+    s_current_candidate_index.store(0, std::memory_order_relaxed);
+    s_offline_since_us.store(0, std::memory_order_relaxed);
+    s_failover_attempts_in_round.store(0, std::memory_order_relaxed);
+    s_failover_task_running.store(false, std::memory_order_relaxed);
     s_has_sta_credentials.store(!candidates.empty(), std::memory_order_relaxed);
 
     s_sta_netif = esp_netif_create_default_wifi_sta();
