@@ -1545,10 +1545,11 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
     const std::string* pass = find_field(fields, "pass");
     const std::string* ssid2 = find_field(fields, "ssid2");
     const std::string* pass2 = find_field(fields, "pass2");
-    esp_err_t err = idf_config_save_wifi(ssid ? *ssid : std::string(),
-                                         pass ? *pass : std::string(),
-                                         ssid2 ? *ssid2 : std::string(),
-                                         pass2 ? *pass2 : std::string());
+    std::string ssid_s = ssid ? *ssid : std::string();
+    std::string pass_s = pass ? *pass : std::string();
+    std::string ssid2_s = ssid2 ? *ssid2 : std::string();
+    std::string pass2_s = pass2 ? *pass2 : std::string();
+    esp_err_t err = idf_config_save_wifi(ssid_s, pass_s, ssid2_s, pass2_s);
     set_json_no_cache(req);
     if (err != ESP_OK) {
         std::string msg = "{\"success\":false,\"message\":\"WiFi 配置无效\"}";
