@@ -81,11 +81,11 @@ jobs:
             build/idf/partition_table/partition-table.bin
           retention-days: 7
 
-      # 推送到 master 时自动发布/更新 Release：tag 为 v<版本号>，附可直接下载的固件。
+      # 推送到 master 或手动触发 master 构建时发布/更新 Release：tag 为 v<版本号>，附可直接下载的固件。
       # Release 说明需包含 OTA 包、整机烧录包和可直接复制的烧录命令。
       # 同版本再次推送会更新既有 Release 的附件（覆盖同名文件），不会重复建 Release。
       - name: Publish GitHub Release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.version }}
