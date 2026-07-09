@@ -43,6 +43,7 @@ static constexpr uint32_t IDENTITY_RETRY_INTERVAL_MS = 600000UL;
 // 采样仍受 at_channel_idle 门控，不与收发/保号抢 AT 通道
 static constexpr uint32_t SIGNAL_INTERVAL_WEB_MS = 10000UL;
 static constexpr uint32_t SIGNAL_DETAIL_INTERVAL_WEB_MS = 30000UL;
+static constexpr uint32_t SIM_CHECK_INTERVAL_MS = 15000UL;  // SIM 热插拔检测轮询间隔
 static constexpr int64_t WEB_POLL_ACTIVE_WINDOW_US = 15LL * 1000LL * 1000LL;
 static constexpr size_t URC_BUFFER_MAX = 4096;
 
@@ -700,8 +701,9 @@ static std::string parse_cops(const std::string& resp)
     size_t p = resp.find("+COPS:");
     if (p == std::string::npos) return {};
     std::string line = line_containing(resp, p);
-    std::string quoted = first_quoted(line);
-    return quoted.empty() ? line : quoted;
+    // 自动模式下若未先选名称格式，AT+COPS? 只回 "+COPS: 0"(无引号运营商名)。
+    // 此时返回空让上层改用 COPS=3,0 重试，而不是把模式位当运营商缓存下来。
+    return first_quoted(line);
 }
 
 static std::string parse_apn(const std::string& resp)
@@ -1203,7 +1205,11 @@ static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint3
 {
     std::string resp;
     std::string apn = trim(cfg.apn);
-    if (cfg.dataEnabled) {
+    // 数据漫游策略：未勾选"允许数据漫游"且当前处于漫游(CEREG=5)时不激活蜂窝数据。
+    // 启动阶段注册状态未知(stat=-1)会乐观激活，注册完成后由 enforce_roaming_data_policy 兜底关闭。
+    bool want_data = cfg.dataEnabled &&
+                     (cfg.roamingEnabled || idf_modem_get_status().ceregStat != 5);
+    if (want_data) {
         if (!apn.empty() && apn_valid_for_at(apn)) {
             std::string cmd = "AT+CGDCONT=1,\"IP\",\"";
             cmd += apn;
@@ -1220,6 +1226,21 @@ static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint3
     bool ok = send_ok("AT+CGACT=0,1", inactive_timeout_ms, &resp);
     if (ok) set_status_cell_ip("");
     return ok;
+}
+
+// 数据漫游策略兜底：未勾选"允许数据漫游"且当前漫游(stat=5)时确保蜂窝数据关闭。
+// 启动阶段拿不到注册状态会先乐观激活，注册完成后在此关闭，避免漫游误跑流量。
+// 短信不受影响(走 CS/IMS 信令域)。归属网络(stat=1)不干预，按常规激活。
+static void enforce_roaming_data_policy(const IdfSimSettingsView& cfg, int stat)
+{
+    if (!cfg.dataEnabled || cfg.roamingEnabled) return;  // 未开数据或允许漫游数据：无需干预
+    if (stat != 5) return;                                // 非漫游：归属网络按常规激活即可
+    if (idf_modem_get_status().cellIp.empty()) return;    // 数据本就未激活，无需再关
+    std::string resp;
+    if (send_ok("AT+CGACT=0,1", 3000, &resp)) {
+        set_status_cell_ip("");
+        idf_log_line("数据漫游已关闭：检测到漫游，已停用蜂窝数据(不跑流量)");
+    }
 }
 
 static void schedule_data_mode_retry(void)
@@ -1537,6 +1558,8 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
                         (!s_identity_network_attempted || before.operatorName.empty());
     if (need_network) {
         if (before.operatorName.empty()) {
+            // 先选长名称格式：自动模式下不设格式时 COPS? 只回模式位(+COPS: 0)，读不到运营商名
+            send_ok("AT+COPS=3,0", 1500, &resp);
             if (send_ok("AT+COPS?", 1500, &resp)) patch.operatorName = parse_cops(resp);
             vTaskDelay(pdMS_TO_TICKS(150));
         }
@@ -1650,20 +1673,85 @@ static bool modem_quick_start_allowed(esp_reset_reason_t reason)
     }
 }
 
+// 解析 AT+CPMS 设置命令的响应 "+CPMS: <used1>,<total1>,<used2>,<total2>,<used3>,<total3>"，
+// 输出 <mem1> 总容量。查询响应(+CPMS: "SM",0,0,...)带引号存储名会解析失败，恰好只匹配设置响应。
+static bool parse_cpms_total(const std::string& resp, long& total)
+{
+    size_t p = resp.find("+CPMS:");
+    if (p == std::string::npos) return false;
+    std::string line = line_containing(resp, p);
+    const char* token = strstr(line.c_str(), "+CPMS:");
+    if (!token) return false;
+    long values[6] = {};
+    int count = 0;
+    if (!parse_comma_longs(token + strlen("+CPMS:"), values, 6, count) || count < 2) return false;
+    total = values[1];
+    return true;
+}
+
+// 按优先级选择短信存储：MT → ME → SM。部分可写 eSIM 的 SM 存储返回 OK 但容量为
+// 0,0(issue #3)，此时短信实际无处可存，必须视为不可用并继续尝试下一候选；
+// 响应里解析不出容量的按可用处理(不同固件设置命令可能只回 OK)。
+static bool select_sms_storage(void)
+{
+    static const struct { const char* cmd; const char* name; } kCandidates[] = {
+        {"AT+CPMS=\"MT\",\"MT\",\"MT\"", "MT"},
+        {"AT+CPMS=\"ME\",\"ME\",\"ME\"", "ME"},
+        {"AT+CPMS=\"SM\",\"SM\",\"SM\"", "SM"},
+    };
+    for (const auto& c : kCandidates) {
+        std::string resp;
+        if (!send_ok(c.cmd, 1500, &resp)) continue;
+        long total = -1;
+        if (parse_cpms_total(resp, total) && total <= 0) {
+            idf_logf("短信存储 %s 容量为 0，尝试下一候选", c.name);
+            continue;
+        }
+        // MT 是常规路径，成功时不打日志，避免每次初始化都刷一行
+        if (strcmp(c.name, "MT") != 0) idf_logf("短信存储使用 %s", c.name);
+        return true;
+    }
+    idf_log_line("警告: 无可用短信存储(MT/ME/SM 均不可用)，短信接收可能失败");
+    return false;
+}
+
+// 存储选择失败待补跑标志：冷启动时 CPMS 早于 SIM 就绪执行，SIM 初始化慢的开机
+// 可能三个候选全失败(SIM busy)。注册成功意味着 SIM 必已就绪，届时补跑一次。
+// 只在 modem_task 上下文读写，无需原子量。
+static bool s_sms_storage_pending = false;
+
+static void retry_sms_storage_if_pending(void)
+{
+    if (!s_sms_storage_pending) return;
+    idf_log_line("SIM 已就绪，补跑短信存储选择");
+    s_sms_storage_pending = !select_sms_storage();
+}
+
 static void configure_sms_and_registration(void)
 {
     send_ok("ATE0", 1000);
     send_ok("AT+CMGF=0", 1200);
     // 统一收/存/读的短信存储位置：CNMI mt=1 投递到 <mem3>，CMGL/CMGR 读 <mem1>，
-    // 两者不一致时 +CMTI 索引和补收轮询会看不同的存储，短信被静默丢失(对齐 Arduino)
-    if (!send_ok("AT+CPMS=\"MT\",\"MT\",\"MT\"", 1500)) {
-        send_ok("AT+CPMS=\"SM\",\"SM\",\"SM\"", 1500);
-    }
+    // 两者不一致时 +CMTI 索引和补收轮询会看不同的存储，短信被静默丢失
+    s_sms_storage_pending = !select_sms_storage();
     send_ok("AT+CNMI=2,1,0,0,0", 1200);
     send_ok("AT+CEREG=2", 1200);
+    // 开启主叫号码上报：来电时模组主动上报 RING + +CLIP: "号码",...，供来电通知使用。
+    // 无语音能力的卡/模组下该指令可能 ERROR，忽略即可(收不到来电就不会有 URC)。
+    send_ok("AT+CLIP=1", 1200);
     // NET 指示灯开关(ML307R: AT+MLED=0,<0/1>)：每次初始化按保存的配置下发，
     // 覆盖模组记住的上次状态
     send_ok(idf_config_net_led_enabled() ? "AT+MLED=0,1" : "AT+MLED=0,0", 1200);
+}
+
+// 查询 SIM 是否就绪：AT+CPIN? 返回 +CPIN: READY 视为有卡可用；无卡/卡故障时模组回
+// +CME ERROR(10=无卡,13=卡故障)，send_ok 返回 false。用于运行中热插拔检测。
+static bool query_sim_ready(void)
+{
+    std::string resp;
+    if (!send_ok("AT+CPIN?", 1500, &resp)) return false;
+    return resp.find("+CPIN: READY") != std::string::npos ||
+           resp.find("+CPIN:READY") != std::string::npos;
 }
 
 // 重启后 AT 握手失败时置位：一旦后续任何探测发现 AT 恢复，立即补跑完整初始化
@@ -1810,9 +1898,11 @@ static void modem_task(void*)
     if (!registered) {
         set_phase("failed");
     } else {
+        retry_sms_storage_if_pending();
         IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
         apply_operator_if_configured(cfg);
         if (cfg.dataEnabled) sample_cell_ip_once();
+        enforce_roaming_data_policy(cfg, stat);
         // 注册成功后立即做一轮首页基础信息采样；Web/WiFi 已先启动，不会阻塞页面打开。
         sample_signal_once();
         sample_signal_detail_once();
@@ -1827,6 +1917,8 @@ static void modem_task(void*)
     TickType_t last_health = 0;
     int health_fail_count = 0;
     int dereg_count = 0;
+    TickType_t last_sim_check = 0;
+    int sim_present = -1;  // -1=未知(仅记基线) 0=无卡 1=有卡
     while (true) {
         handle_reset_request_if_any();
         run_pending_reinit_if_recovered();
@@ -1884,9 +1976,11 @@ static void modem_task(void*)
                     dereg_count = 0;
                     if (!post_register_done) {
                         // 迟到/恢复的注册也要补跑必须的网络配置和首页基础信息。
+                        retry_sms_storage_if_pending();
                         IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
                         apply_operator_if_configured(cfg);
                         if (cfg.dataEnabled) sample_cell_ip_once();
+                        enforce_roaming_data_policy(cfg, stat);
                         sample_signal_once();
                         sample_signal_detail_once();
                         sample_identity_once(false, true);
@@ -1908,6 +2002,35 @@ static void modem_task(void*)
                 health_fail_count = 0;
                 idf_log_line("模组健康探测连续失败，触发硬重启恢复");
                 s_reset_request.store(2, std::memory_order_relaxed);
+            }
+        }
+        // SIM 热插拔检测：低频轮询 AT+CPIN?，识别运行中插卡/拔卡。
+        // 插入(无卡→有卡)：重跑短信/网络配置 + 作废旧身份触发重采样，让新卡自动初始化；
+        // 拔出(有卡→无卡)：标记未就绪并清空身份，避免概览沿用旧卡信息。
+        if ((last_sim_check == 0 || now - last_sim_check > pdMS_TO_TICKS(SIM_CHECK_INTERVAL_MS)) &&
+            at_channel_idle_now()) {
+            last_sim_check = now;
+            int present_now = query_sim_ready() ? 1 : 0;
+            if (sim_present == -1) {
+                sim_present = present_now;  // 首次仅记基线，不当作插拔事件
+            } else if (present_now != sim_present) {
+                sim_present = present_now;
+                if (present_now == 1) {
+                    idf_log_line("检测到 SIM 卡插入，重新初始化模组");
+                    configure_sms_and_registration();
+                    idf_modem_invalidate_sim_identity();
+                    registered = false;
+                    post_register_done = false;
+                    dereg_count = 0;
+                    last_health = 0;  // 下一轮立即重查 CEREG，尽快感知新卡注册
+                    set_phase("registering");
+                } else {
+                    idf_log_line("检测到 SIM 卡移除");
+                    registered = false;
+                    post_register_done = false;
+                    idf_modem_invalidate_sim_identity();
+                    set_phase("registering");
+                }
             }
         }
         for (int i = 0; i < 10; ++i) {
@@ -2026,6 +2149,24 @@ void idf_modem_request_status_sample(void)
 {
     s_last_web_poll_us.store(esp_timer_get_time(), std::memory_order_relaxed);
     s_status_sample_requests.fetch_add(1, std::memory_order_relaxed);
+}
+
+void idf_modem_invalidate_sim_identity(void)
+{
+    // 清除随卡变化的身份字段：切/启/禁 eSIM Profile 后当前生效的卡已不同，
+    // 但 sample_identity_once 对非空字段跳过重读，会一直沿用旧卡的号码/ICCID/运营商。
+    if (s_status_mutex && xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        s_status.iccid.clear();
+        s_status.imsi.clear();
+        s_status.phone.clear();
+        s_status.operatorName.clear();
+        s_status.apnSim.clear();
+        s_status.identityFresh = false;
+        xSemaphoreGive(s_status_mutex);
+    }
+    // 复位采样"已尝试"标志，让网络字段(运营商/号码)重新查询；静态字段(型号/IMEI)非空仍跳过
+    reset_identity_sampling_state();
+    idf_modem_request_status_sample();
 }
 
 void idf_modem_power_off_for_restart(void)

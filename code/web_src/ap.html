@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SMS 转发器</title>
+<style>
+:root{color-scheme:light dark}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:#f5f6f8;color:#1a1d21;padding:16px;line-height:1.5}
+.card{max-width:460px;margin:24px auto;background:#fff;border:1px solid #e3e6ea;border-radius:12px;padding:20px;box-shadow:0 2px 12px rgba(0,0,0,.06)}
+h1{font-size:18px;margin:0 0 4px}
+.sub{font-size:12.5px;color:#6b7280;margin:0 0 16px}
+label{display:block;font-size:12.5px;font-weight:600;margin:12px 0 5px}
+select,input{width:100%;padding:9px 10px;font-size:14px;border:1px solid #cbd0d6;border-radius:8px;background:#fff;color:#1a1d21}
+.row{display:flex;gap:8px;align-items:flex-end}
+.row select{flex:1}
+button{width:100%;margin-top:16px;padding:11px;font-size:14px;font-weight:600;color:#fff;background:#2f81f7;border:0;border-radius:8px;cursor:pointer}
+button:disabled{opacity:.6;cursor:default}
+button.sec{background:#e3e6ea;color:#1a1d21;width:auto;margin:0;padding:9px 14px;flex:0 0 auto}
+.msg{margin-top:14px;padding:11px 12px;border-radius:8px;font-size:13px;display:none}
+.msg.show{display:block}
+.msg.info{background:#eaf2ff;color:#1c4e8a}
+.msg.ok{background:#e7f6ec;color:#1a7f37}
+.msg.err{background:#fdecec;color:#b42318}
+.ip{display:inline-block;margin:6px 0;font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:700;font-size:16px}
+@media(prefers-color-scheme:dark){body{background:#15181c;color:#e6e8eb}.card{background:#1e2228;border-color:#2c313a}select,input{background:#15181c;color:#e6e8eb;border-color:#3a414c}.sub{color:#9aa4b0}button.sec{background:#2c313a;color:#e6e8eb}}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>SMS 转发器</h1>
+<p class="sub">选择要接入的 WiFi，保存后设备会连接并显示访问地址。此页面只用于配网，不涉及其它设置。</p>
+<label>选择网络</label>
+<div class="row">
+<select id="sel"><option value="">点右侧「扫描」获取周边 WiFi</option></select>
+<button class="sec" id="scanBtn" onclick="scan()">扫描</button>
+</div>
+<label>WiFi 名称 (SSID)</label>
+<input id="ssid" type="text" placeholder="从上方选择或手动输入">
+<label>WiFi 密码</label>
+<input id="pass" type="password" placeholder="开放网络留空">
+<button id="saveBtn" onclick="save()">保存并连接</button>
+<div class="msg" id="msg"></div>
+</div>
+<script>
+function $(i){return document.getElementById(i)}
+function show(cls,html){var m=$('msg');m.className='msg show '+cls;m.innerHTML=html}
+function scan(){
+var b=$('scanBtn');b.disabled=true;b.textContent='扫描中';
+fetch('/wifiscan?_='+Date.now(),{cache:'no-store'}).then(function(r){return r.json()}).then(function(a){
+var s=$('sel');
+if(!a||!a.length){s.innerHTML='<option value="">未发现 WiFi</option>';return}
+a.sort(function(x,y){return y.rssi-x.rssi});
+s.innerHTML='';
+var o=document.createElement('option');o.value='';o.textContent='共 '+a.length+' 个，请选择';s.appendChild(o);
+a.forEach(function(w){var e=document.createElement('option');e.value=w.ssid;e.textContent=(w.ssid||'(隐藏网络)')+' · '+w.rssi+'dBm'+(w.enc?' · 加密':' · 开放');s.appendChild(e)});
+}).catch(function(){$('sel').innerHTML='<option value="">扫描失败，请重试</option>'}).finally(function(){b.disabled=false;b.textContent='扫描'});
+}
+$('sel').onchange=function(){if(this.value){$('ssid').value=this.value;$('pass').focus()}};
+var poll=null,timer=null;
+function save(){
+var ssid=$('ssid').value.trim();
+if(!ssid){show('err','请输入 WiFi 名称');return}
+var b=$('saveBtn');b.disabled=true;b.textContent='连接中…';
+var body='ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent($('pass').value);
+fetch('/wificonfig',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).then(function(r){return r.json()}).then(function(d){
+if(!d.success){show('err',d.message||'配置无效');b.disabled=false;b.textContent='保存并连接';return}
+show('info','已保存，正在连接 <b>'+(ssid.replace(/</g,'&lt;'))+'</b> …<br>切换信道时本页可能短暂断开，会自动恢复，请稍候。');
+startPoll();
+}).catch(function(){show('info','已提交，正在连接…请稍候。');startPoll()});
+}
+function startPoll(){
+if(poll)clearInterval(poll);
+var tries=0;
+poll=setInterval(function(){
+tries++;
+fetch('/apstatus?_='+Date.now(),{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
+if(d.connected&&d.ip){done(d.ip);return}
+if(tries>=24){clearInterval(poll);poll=null;show('err','连接超时，请确认 WiFi 密码是否正确后重试。');var b=$('saveBtn');b.disabled=false;b.textContent='重新连接'}
+}).catch(function(){});
+},1500);
+}
+function done(ip){
+if(poll){clearInterval(poll);poll=null}
+var n=15;
+show('ok','✓ 已连接成功！请改用下面地址访问设备（把手机/电脑连回你的 WiFi 后打开）：<br><span class="ip">http://'+ip+'</span><br><span id="cd">配网热点将在 '+n+' 秒后自动关闭…</span>');
+if(timer)clearInterval(timer);
+timer=setInterval(function(){n--;var c=document.getElementById('cd');if(!c)return;if(n>0){c.textContent='配网热点将在 '+n+' 秒后自动关闭…'}else{c.textContent='配网热点已关闭。请连接你的 WiFi 后访问上面的地址。';clearInterval(timer)}},1000);
+}
+</script>
+</body>
+</html>

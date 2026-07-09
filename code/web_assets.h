@@ -15,6 +15,7 @@ extern const char WEB_ASSET_HASH[];
 extern const WebAsset WEB_INDEX;
 extern const WebAsset WEB_APP_CSS;
 extern const WebAsset WEB_APP_JS;
+extern const WebAsset WEB_AP;
 
 const WebAsset* findWebPanelAsset(const char* name);
 

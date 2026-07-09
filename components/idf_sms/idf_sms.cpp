@@ -602,10 +602,89 @@ static void expire_concat_slots()
     }
 }
 
+// ===== 来电通知 =====
+// 一通来电会重复上报 RING/+CLIP，只在"新来电"时通知一次；超过间隔视为新的一通。
+static int64_t s_call_window_us = 0;   // 当前来电最近一次 RING/+CLIP 时间
+static bool s_call_notified = false;   // 当前来电是否已通知
+static bool s_call_saw_ring = false;   // 当前来电是否见过 RING(未知号码兜底用)
+static std::string s_call_number;      // 当前来电号码(来自 +CLIP)
+static constexpr int64_t CALL_GAP_US = 30LL * 1000 * 1000;          // 超过则视为新来电
+static constexpr int64_t CALL_UNKNOWN_DELAY_US = 3LL * 1000 * 1000; // RING 后等 +CLIP 的宽限
+
+// 从 +CLIP: "号码",类型,... 中取第一对引号内的号码
+static std::string parse_clip_number(const std::string& line)
+{
+    size_t q1 = line.find('"');
+    if (q1 == std::string::npos) return {};
+    size_t q2 = line.find('"', q1 + 1);
+    if (q2 == std::string::npos) return {};
+    return line.substr(q1 + 1, q2 - q1 - 1);
+}
+
+static void notify_incoming_call(const std::string& number)
+{
+    if (!idf_config_call_notify_enabled()) return;
+    // 黑名单同时作用于来电：命中则不通知(未知号码无从匹配，照常通知)
+    if (!number.empty()) {
+        const IdfSmsProcessView cfg = idf_config_get_sms_process_view();
+        if (number_blacklisted(cfg.numberBlackList, number)) {
+            idf_logf("来电 %s 在黑名单中，已忽略", number.c_str());
+            return;
+        }
+    }
+    std::string num = number.empty() ? std::string("未知号码") : number;
+    std::string body = "来电：" + num;
+    std::string display_ts = format_epoch_local(static_cast<uint32_t>(time(nullptr)),
+                                                idf_config_get_tz_offset());
+    idf_logf("来电通知：%s，入队转发中", num.c_str());
+    // 复用短信转发通道：发件人=来电号码，正文=来电提示，走与短信相同的推送+邮件
+    if (!idf_push_enqueue_forward(num.c_str(), body.c_str(), display_ts.c_str(), 0)) {
+        idf_log_line("转发入口队列已满，来电通知未能入队");
+    }
+}
+
+// RING/+CLIP 独立于短信处理；同一通来电只通知一次
+static void handle_call_urc_line(const std::string& line)
+{
+    int64_t now = esp_timer_get_time();
+    if (now - s_call_window_us > CALL_GAP_US) {  // 新来电：重置去重状态
+        s_call_notified = false;
+        s_call_saw_ring = false;
+        s_call_number.clear();
+    }
+    s_call_window_us = now;
+    if (starts_with(line, "+CLIP:")) {
+        std::string num = parse_clip_number(line);
+        if (!num.empty()) s_call_number = num;
+        if (!s_call_notified) {
+            s_call_notified = true;
+            notify_incoming_call(s_call_number);
+        }
+    } else {  // RING：号码可能随后由 +CLIP 补上，无号码时由 flush 兜底
+        s_call_saw_ring = true;
+    }
+}
+
+// RING 后迟迟没有 +CLIP(号码被隐藏)：宽限期后按未知号码通知一次
+static void flush_pending_call_notify(void)
+{
+    if (s_call_saw_ring && !s_call_notified &&
+        esp_timer_get_time() - s_call_window_us > CALL_UNKNOWN_DELAY_US) {
+        s_call_notified = true;
+        notify_incoming_call(std::string());
+    }
+}
+
 static void process_urc_line(const std::string& raw)
 {
     std::string line = trim(raw);
     if (line.empty()) return;
+
+    // 来电通知：RING/+CLIP 优先处理并返回，独立于短信 PDU 等待逻辑
+    if (line == "RING" || starts_with(line, "+CLIP:")) {
+        handle_call_urc_line(line);
+        return;
+    }
 
     if (s_wait_pdu) {
         if (starts_with(line, "+CMT:")) return;
@@ -817,6 +896,7 @@ static void sms_task(void*)
         std::string urc;
         if (idf_modem_take_urc(urc)) process_urc_text(urc);
         expire_wait_pdu_window();
+        flush_pending_call_notify();
         expire_concat_slots();
 
         IdfModemStatus modem = idf_modem_get_status();

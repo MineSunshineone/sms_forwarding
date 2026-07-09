@@ -190,8 +190,32 @@ static bool auth_matches_config(const char* auth)
     return idf_config_check_web_auth(reinterpret_cast<char*>(decoded), colon + 1);
 }
 
+// 配网热点模式下允许免认证访问的接口白名单：只覆盖"进入独立配网页并配好 WiFi"
+// 所需的最小集合。刻意不放行 /ui、/status、/config.json、/assets 等——配网页是
+// 自包含的独立页面，不需要它们；不放行可避免开放热点期间暴露完整后台与已有配置。
+static bool is_ap_open_uri(const char* uri)
+{
+    if (!uri) return false;
+    // 按"路径"精确匹配，忽略 ?query
+    size_t path_len = strcspn(uri, "?");
+    static const char* const kOpen[] = {
+        "/", "/wifiscan", "/wificonfig", "/apstatus",
+    };
+    for (const char* p : kOpen) {
+        if (strlen(p) == path_len && strncmp(uri, p, path_len) == 0) return true;
+    }
+    return false;
+}
+
 static bool check_auth(httpd_req_t* req)
 {
+    // 配网热点(开放 AP)模式下放行配网所需接口：设备此时是开放无加密热点，系统
+    // Captive Portal 探测/弹窗只能拿到 401(显示 "unauthorized")，新用户无从进入
+    // 配网页面(见 issue #1)；且开放空口上 Basic 凭据本就明文可嗅探，对这几个
+    // 只读/配网接口强制认证意义不大。导出/导入/OTA/发短信/收件箱等敏感接口不在
+    // 白名单内，仍需认证，避免开放热点期间泄露密钥或被滥用。
+    if (idf_wifi_is_ap_mode() && is_ap_open_uri(req->uri)) return true;
+
     char auth[512] = {};
     if (httpd_req_get_hdr_value_str(req, "Authorization", auth, sizeof(auth)) == ESP_OK &&
         auth_matches_config(auth)) {
@@ -279,6 +303,10 @@ static esp_err_t send_gzip_asset(httpd_req_t* req, const WebAsset& asset, const 
 
 static esp_err_t handle_root(httpd_req_t* req)
 {
+    // 配网热点模式：只下发自包含的独立配网页(免密)，不加载完整后台，杜绝已有配置暴露
+    if (idf_wifi_is_ap_mode()) {
+        return send_gzip_asset(req, WEB_AP, "no-store, max-age=0");
+    }
     if (!check_auth(req)) return ESP_OK;
     return send_gzip_asset(req, WEB_INDEX, "no-store, max-age=0");
 }
@@ -494,11 +522,12 @@ static esp_err_t send_config_json(httpd_req_t* req)
     json_prop(body, "ntpServer", cfg.ntpServer); body += ",";
     snprintf(buf, sizeof(buf),
              "\"tzOffsetMin\":%d,\"rebootEnabled\":%s,\"rebootHour\":%d,"
-             "\"hbEnabled\":%s,\"hbHour\":%d,\"dataEnabled\":%s,",
+             "\"hbEnabled\":%s,\"hbHour\":%d,\"dataEnabled\":%s,\"roamingEnabled\":%s,",
              cfg.tzOffsetMin,
              cfg.rebootEnabled ? "true" : "false", cfg.rebootHour,
              cfg.hbEnabled ? "true" : "false", cfg.hbHour,
-             cfg.dataEnabled ? "true" : "false");
+             cfg.dataEnabled ? "true" : "false",
+             cfg.roamingEnabled ? "true" : "false");
     body += buf;
     json_prop(body, "apn", cfg.apn); body += ",";
     json_prop(body, "phoneNumber", cfg.phoneNumber); body += ",";
@@ -506,6 +535,9 @@ static esp_err_t send_config_json(httpd_req_t* req)
     json_prop(body, "kaProfile", cfg.kaProfile); body += ",";
     body += "\"netLedEnabled\":";
     body += cfg.netLedEnabled ? "true" : "false";
+    body += ",";
+    body += "\"callNotifyEnabled\":";
+    body += cfg.callNotifyEnabled ? "true" : "false";
     body += ",";
     body += "\"pushChannels\":[";
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
@@ -981,6 +1013,8 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
         }
     } else if (action == "operator") {
         std::string resp;
+        // 先选长名称格式，否则自动模式下 COPS? 只回模式位(+COPS: 0)，读不到运营商名
+        idf_modem_send_at("AT+COPS=3,0", 3000, resp);
         esp_err_t err = idf_modem_send_at("AT+COPS?", 5000, resp);
         std::string line = first_line_containing(resp, "+COPS:");
         if (err == ESP_OK && !line.empty()) {
@@ -1069,6 +1103,7 @@ struct ModemApplyTaskArg {
     bool dataChanged = false;
     bool operatorChanged = false;
     bool dataEnabled = false;
+    bool roamingEnabled = true;
     std::string apn;
     std::string operatorPlmn;
 };
@@ -1079,6 +1114,7 @@ static void modem_apply_task(void* raw)
     bool data_changed = arg->dataChanged;
     bool operator_changed = arg->operatorChanged;
     bool data_enabled = arg->dataEnabled;
+    bool roaming_enabled = arg->roamingEnabled;
     std::string apn = std::move(arg->apn);
     std::string operator_plmn = std::move(arg->operatorPlmn);
     delete arg;
@@ -1131,7 +1167,11 @@ static void modem_apply_task(void* raw)
     }
 
     if (data_changed) {
-        if (data_enabled) {
+        if (data_enabled && !roaming_enabled && modem.ceregStat == 5) {
+            // 数据漫游关闭且当前漫游：不激活蜂窝数据(短信仍走 CS/IMS 不受影响)
+            idf_modem_send_at("AT+CGACT=0,1", 5000, resp);
+            idf_log_line("数据漫游已关闭：当前处于漫游，未激活蜂窝数据(不跑流量)");
+        } else if (data_enabled) {
             if (!apn.empty() && apn_valid_for_at(apn)) {
                 std::string cmd = "AT+CGDCONT=1,\"IP\",\"" + apn + "\"";
                 idf_modem_send_at(cmd, 3000, resp);
@@ -1241,12 +1281,13 @@ static esp_err_t handle_save(httpd_req_t* req)
     const bool st_form = has_field(fields, "stForm");
     const bool system_sched_form = has_field(fields, "systemSchedForm");
     const bool sim_form = has_field(fields, "simForm");
+    const bool call_form = has_field(fields, "callForm");
     const int form_count = (account_form ? 1 : 0) + (tz_form ? 1 : 0) +
                            (led_form ? 1 : 0) + (email_form ? 1 : 0) +
                            (push_form ? 1 : 0) + (filter_form ? 1 : 0) +
                            (rules_form ? 1 : 0) + (ka_form ? 1 : 0) +
                            (st_form ? 1 : 0) + (system_sched_form ? 1 : 0) +
-                           (sim_form ? 1 : 0);
+                           (sim_form ? 1 : 0) + (call_form ? 1 : 0);
     if (form_count != 1) {
         idf_log_line(form_count == 0 ? "网页保存请求缺少表单标记，已忽略"
                                      : "网页保存请求包含多个表单标记，已拒绝");
@@ -1296,6 +1337,17 @@ static esp_err_t handle_save(httpd_req_t* req)
         return ESP_OK;
     }
 
+    if (call_form) {
+        bool enabled = has_field(fields, "callNotifyEnabled");
+        esp_err_t err = idf_config_set_call_notify_enabled(enabled);
+        if (err != ESP_OK) return fail(err);
+        httpd_resp_set_type(req, "text/plain");
+        set_no_cache_headers(req);
+        httpd_resp_sendstr(req, "OK");
+        idf_logf("网页保存来电通知配置: %s", enabled ? "开启" : "关闭");
+        return ESP_OK;
+    }
+
     if (email_form) {
         std::string smtp_pass = field_text(fields, "smtpPass");
         bool preserve_smtp_pass = field_blank(smtp_pass);
@@ -1320,8 +1372,14 @@ static esp_err_t handle_save(httpd_req_t* req)
     }
 
     if (filter_form) {
-        esp_err_t err = idf_config_save_filter(field_text(fields, "adminPhone"),
-                                               field_text(fields, "numberBlackList"));
+        // 管理员号码与黑名单已拆成两个独立表单，各自只提交自己的字段：
+        // 本次未提交的字段读当前值保留，避免只存其一时把另一个清空。
+        IdfConfigWebView cur = idf_config_get_web_view();
+        std::string admin = has_field(fields, "adminPhone")
+                                ? field_text(fields, "adminPhone") : cur.adminPhone;
+        std::string blacklist = has_field(fields, "numberBlackList")
+                                    ? field_text(fields, "numberBlackList") : cur.numberBlackList;
+        esp_err_t err = idf_config_save_filter(admin, blacklist);
         if (err != ESP_OK) return fail(err);
         return ok("网页保存权限与过滤");
     }
@@ -1363,11 +1421,14 @@ static esp_err_t handle_save(httpd_req_t* req)
     if (sim_form) {
         IdfSimSettingsView before = idf_config_get_sim_settings_view();
         esp_err_t err = idf_config_save_sim(has_field(fields, "dataEnabled"),
+                                            has_field(fields, "roamingEnabled"),
                                             field_text(fields, "apn"),
-                                            field_text(fields, "operatorPlmn"));
+                                            field_text(fields, "operatorPlmn"),
+                                            field_text(fields, "phoneNumber"));
         if (err != ESP_OK) return fail(err);
         IdfSimSettingsView after = idf_config_get_sim_settings_view();
-        bool data_changed = before.dataEnabled != after.dataEnabled || before.apn != after.apn;
+        bool data_changed = before.dataEnabled != after.dataEnabled || before.apn != after.apn ||
+                            before.roamingEnabled != after.roamingEnabled;
         bool operator_changed = before.operatorPlmn != after.operatorPlmn;
 
         httpd_resp_set_type(req, "text/plain");
@@ -1489,10 +1550,33 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
         std::string msg = "{\"success\":false,\"message\":\"WiFi 配置无效\"}";
         return httpd_resp_send(req, msg.c_str(), msg.size());
     }
+    if (idf_wifi_is_ap_mode()) {
+        // 配网热点内：原地 APSTA 连接、不重启，配网页轮询 /apstatus 显示 IP，
+        // 连上后由设备延时自动关闭热点(见 idf_wifi_provision_connect)
+        idf_wifi_provision_connect(ssid_s, pass_s);
+        std::string msg = "{\"success\":true,\"message\":\"已保存，正在连接\"}";
+        return httpd_resp_send(req, msg.c_str(), msg.size());
+    }
     std::string msg = "{\"success\":true,\"message\":\"WiFi 已保存，设备即将重启\"}";
     esp_err_t send_err = httpd_resp_send(req, msg.c_str(), msg.size());
     schedule_restart_or_now("wifi_restart");
     return send_err;
+}
+
+// 配网专用极简状态：只回连接态与本机 STA IP，绝不包含任何已有配置
+static esp_err_t handle_apstatus(httpd_req_t* req)
+{
+    if (!check_auth(req)) return ESP_OK;  // AP 模式经白名单免密；STA 模式仍需登录
+    IdfWifiStatus wifi = idf_wifi_get_status();
+    set_json_no_cache(req);
+    std::string body = "{\"apMode\":";
+    body += wifi.apMode ? "true" : "false";
+    body += ",\"connected\":";
+    body += (wifi.staConnected && !wifi.ip.empty()) ? "true" : "false";
+    body += ",\"ip\":\"";
+    body += wifi.ip;
+    body += "\"}";
+    return httpd_resp_send(req, body.c_str(), body.size());
 }
 
 static esp_err_t handle_wifi(httpd_req_t* req)
@@ -2145,6 +2229,10 @@ static void esim_task(void* arg_raw)
     }
 
     bool ok = (err == ESP_OK);
+    // 启用/切换/禁用改变当前生效的卡：让模组重读号码/ICCID/运营商，避免概览沿用旧卡缓存
+    if (ok && (action == "enable" || action == "switch" || action == "disable")) {
+        idf_modem_invalidate_sim_identity();
+    }
     bool cache_ready = false;
     if (ok && action != "refresh" && action != "info") {
         std::string refresh_msg;
@@ -3604,6 +3692,7 @@ esp_err_t idf_web_start(void)
     IDF_WEB_TRY_REGISTER("/ntp", register_handler(s_server, "/ntp", HTTP_POST, handle_ntp));
     IDF_WEB_TRY_REGISTER("/wifiscan", httpd_register_uri_handler(s_server, &wifi_scan));
     IDF_WEB_TRY_REGISTER("/wificonfig", httpd_register_uri_handler(s_server, &wifi_config));
+    IDF_WEB_TRY_REGISTER("/apstatus", register_handler(s_server, "/apstatus", HTTP_GET, handle_apstatus));
     IDF_WEB_TRY_REGISTER("/messages", httpd_register_uri_handler(s_server, &messages));
     IDF_WEB_TRY_REGISTER("/log", httpd_register_uri_handler(s_server, &log));
     IDF_WEB_TRY_REGISTER("/keepalive", register_handler(s_server, "/keepalive", HTTP_ANY, handle_keepalive));

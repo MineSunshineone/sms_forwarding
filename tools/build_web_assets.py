@@ -112,6 +112,7 @@ def build_assets() -> tuple[str, str]:
         read_text(SRC / "index.html"),
         read_text(SRC / "app.css"),
         read_text(SRC / "app.js"),
+        read_text(SRC / "ap.html"),
     ]
     raw_sources.extend(read_text(SRC / "panels" / f"{name}.html") for name in PANELS)
     rev = asset_hash(raw_sources)
@@ -120,8 +121,10 @@ def build_assets() -> tuple[str, str]:
         make_asset("WEB_INDEX", "index", "text/html", SRC / "index.html", raw_sources[0], rev),
         make_asset("WEB_APP_CSS", "app.css", "text/css", SRC / "app.css", raw_sources[1], rev),
         make_asset("WEB_APP_JS", "app.js", "application/javascript", SRC / "app.js", raw_sources[2], rev),
+        # 配网热点专用独立页(自包含，AP 模式下由 handle_root 单独下发)
+        make_asset("WEB_AP", "ap", "text/html", SRC / "ap.html", raw_sources[3], rev),
     ]
-    for name, text in zip(PANELS, raw_sources[3:]):
+    for name, text in zip(PANELS, raw_sources[4:]):
         assets.append(make_asset(f"WEB_PANEL_{name.upper()}", name, "text/html", SRC / "panels" / f"{name}.html", text, rev))
 
     header = f"""#ifndef WEB_ASSETS_H
@@ -141,6 +144,7 @@ extern const char WEB_ASSET_HASH[];
 extern const WebAsset WEB_INDEX;
 extern const WebAsset WEB_APP_CSS;
 extern const WebAsset WEB_APP_JS;
+extern const WebAsset WEB_AP;
 
 const WebAsset* findWebPanelAsset(const char* name);
 

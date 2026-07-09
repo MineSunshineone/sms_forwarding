@@ -63,6 +63,9 @@ IdfModemStatus idf_modem_get_status(void);
 bool idf_modem_at_idle(void);
 // 用户显式请求刷新概览模组信息时，短时间打开展示型身份/信号采样窗口。
 void idf_modem_request_status_sample(void);
+// 启用/切换/禁用 eSIM Profile 后调用：清除缓存的卡相关身份(号码/ICCID/IMSI/运营商/APN)
+// 并请求一次采样，使概览重读新生效 Profile 的信息，而不是沿用旧卡缓存值。
+void idf_modem_invalidate_sim_identity(void);
 // 计划内 ESP 重启(网页重启/每日定时重启/低堆重启)前调用：拉低 EN 让模组彻底断电，
 // 重启后走全新上电。保留"重启设备可救活 AT 正常但收信已死的模组"的原有语义；
 // 热启动快路径只服务于崩溃/看门狗等意外复位

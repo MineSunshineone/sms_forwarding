@@ -12,7 +12,7 @@
           <form action="/save" method="POST" id="kaForm" class="sched-save-block">
           <div class="push-channel st-task ka-card" id="kaCard">
             <div class="push-channel-header">
-              <input type="checkbox" name="kaEnabled" id="kaEnabled" onchange="kaSyncHead()">
+              <input type="checkbox" class="switch-input" name="kaEnabled" id="kaEnabled" onchange="kaSyncHead()"><span class="switch-slider"></span>
               <label for="kaEnabled" class="label-inline">SIM 保号</label>
               <span class="ch-summary">保号任务 · 固定不可删</span>
               <span class="schedule-tag" id="kaCountdown" style="margin-left:auto;">--</span>
@@ -62,8 +62,8 @@
           <div class="push-channel-header"><label class="label-inline">系统定时</label><span class="ch-summary">重启 / 心跳 · 每天固定小时</span></div>
           <div class="push-channel-body">
             <div class="form-row">
-              <div class="form-group"><label><input type="checkbox" name="rebootEnabled" %RB_CHECKED%> 每日定时重启</label><input class="form-input" type="number" name="rebootHour" value="%RB_HOUR%" min="0" max="23"></div>
-              <div class="form-group"><label><input type="checkbox" name="hbEnabled" %HB_CHECKED%> 每日心跳通知（启用的推送/邮件）</label><input class="form-input" type="number" name="hbHour" value="%HB_HOUR%" min="0" max="23"></div>
+              <div class="form-group"><label class="switch-inline" style="margin-bottom:6px;"><input type="checkbox" class="switch-input" name="rebootEnabled" %RB_CHECKED%><span class="switch-slider"></span><span>每日定时重启</span></label><input class="form-input" type="number" name="rebootHour" value="%RB_HOUR%" min="0" max="23"></div>
+              <div class="form-group"><label class="switch-inline" style="margin-bottom:6px;"><input type="checkbox" class="switch-input" name="hbEnabled" %HB_CHECKED%><span class="switch-slider"></span><span>每日心跳通知（启用的推送/邮件）</span></label><input class="form-input" type="number" name="hbHour" value="%HB_HOUR%" min="0" max="23"></div>
             </div>
             <p class="form-hint" style="margin:0;">小时按本地时间 0-23 执行；定时重启建议放在空闲时段</p>
           </div>

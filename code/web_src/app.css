@@ -140,6 +140,21 @@
     .schedule-grid .card { margin-bottom: 0; }
     .schedule-switch { display: flex; align-items: center; gap: 8px; padding: 9px 10px; background: var(--inset); border: 1px solid var(--hairline); border-radius: var(--radius-sm); color: var(--ink); font-size: 12.5px; font-weight: 600; cursor: pointer; }
     .schedule-switch input { width: 14px; height: 14px; accent-color: var(--amber); }
+    /* iOS 风格滑动开关：关=左侧灰，开=右侧蓝；用于蜂窝数据/漫游/NET 灯等单项开关 */
+    .switch-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 10px; background: var(--inset); border: 1px solid var(--hairline); border-radius: var(--radius-sm); color: var(--ink); font-size: 12.5px; font-weight: 600; cursor: pointer; }
+    .switch-row .switch-text { min-width: 0; }
+    .switch-input { position: absolute; opacity: 0; width: 0; height: 0; }
+    .switch-slider { position: relative; display: inline-block; vertical-align: middle; flex: 0 0 auto; width: 40px; height: 22px; border-radius: 999px; background: #8b9198; transition: background 0.18s ease; }
+    .switch-slider::before { content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,0.35); transition: transform 0.18s ease; }
+    .switch-input:checked + .switch-slider { background: #2f81f7; }
+    .switch-input:checked + .switch-slider::before { transform: translateX(18px); }
+    .switch-input:focus-visible + .switch-slider { outline: 2px solid #2f81f7; outline-offset: 2px; }
+    /* 行内开关：用于卡片标题/表单行里替代原生复选框，与 switch-row 视觉一致 */
+    .switch-inline { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+    /* .push-channel-body label{display:block} 特异性更高，会顶掉行内开关的 inline-flex，这里显式恢复 */
+    .push-channel-body label.switch-inline { display: inline-flex; }
+    /* 面板切入首帧回填启用态时临时关过渡，避免卡片"由暗到亮"闪一下 */
+    .no-anim, .no-anim * { transition: none !important; }
     .schedule-status { margin: 12px 0 13px; padding: 9px 10px; background: var(--canvas-soft); border: 1px solid var(--hairline); border-left: 2px solid var(--amber); color: var(--body); font-family: var(--mono); font-size: 11.5px; line-height: 1.5; }
     .schedule-grid .form-row { gap: 12px; }
     .schedule-grid .form-row .form-group { min-width: 0; }

@@ -389,7 +389,9 @@ esp_err_t idf_config_load(void)
         next.hbHour = read_i32(nvs, "hbHour", 9);
 
         next.netLedEnabled = read_bool(nvs, "netLed", true);
+        next.callNotifyEnabled = read_bool(nvs, "callNotify", true);
         next.dataEnabled = read_bool(nvs, "dataEn", false);
+        next.roamingEnabled = read_bool(nvs, "roamEn", true);
         next.apn = read_str(nvs, "apn", "", 96);
         next.operatorPlmn = read_str(nvs, "opPlmn", "", 16);
         next.phoneNumber = read_str(nvs, "phoneNum", "", 64);
@@ -505,7 +507,9 @@ std::string idf_config_export_text(bool full_export)
     append_kv_u32(out, "kaLastTime", c.kaLastTime);
 
     append_kv_i(out, "netLedEnabled", c.netLedEnabled ? 1 : 0);
+    append_kv_i(out, "callNotifyEnabled", c.callNotifyEnabled ? 1 : 0);
     append_kv_i(out, "dataEnabled", c.dataEnabled ? 1 : 0);
+    append_kv_i(out, "roamingEnabled", c.roamingEnabled ? 1 : 0);
     append_kv(out, "apn", c.apn);
     append_kv(out, "operatorPlmn", c.operatorPlmn);
     append_kv(out, "phoneNumber", c.phoneNumber);
@@ -586,7 +590,9 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
     else if (key == "kaProfile") c.kaProfile = value;
     else if (key == "kaLastTime") import_u32_field(c.kaLastTime, value);
     else if (key == "netLedEnabled") c.netLedEnabled = bool_from_text(value);
+    else if (key == "callNotifyEnabled") c.callNotifyEnabled = bool_from_text(value);
     else if (key == "dataEnabled") c.dataEnabled = bool_from_text(value);
+    else if (key == "roamingEnabled") c.roamingEnabled = bool_from_text(value);
     else if (key == "apn") c.apn = value;
     else if (key == "operatorPlmn") c.operatorPlmn = value;
     else if (key == "phoneNumber") c.phoneNumber = value;
@@ -772,6 +778,33 @@ esp_err_t idf_config_set_net_led_enabled(bool enabled)
     return err;
 }
 
+esp_err_t idf_config_set_call_notify_enabled(bool enabled)
+{
+    // 来电通知同样是单布尔开关，单 key 写入即可，避免小表单走全量 NVS 回写
+    esp_err_t err = ensure_config_mutex();
+    if (err != ESP_OK) return err;
+    if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    nvs_handle_t nvs = 0;
+    err = nvs_open("sms_config", NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(nvs, "callNotify", enabled ? 1 : 0);
+        if (err == ESP_OK) err = nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        s_config.callNotifyEnabled = enabled;
+        xSemaphoreGive(s_config_mutex);
+    } else {
+        ESP_LOGE(TAG, "保存来电通知配置失败: %s", esp_err_to_name(err));
+        idf_logf("保存来电通知配置失败: %s", esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_persist_mutex);
+    return err;
+}
+
 static esp_err_t save_config_to_nvs(const IdfConfig& c)
 {
     nvs_handle_t nvs = 0;
@@ -812,7 +845,9 @@ static esp_err_t save_config_to_nvs(const IdfConfig& c)
     if (err == ESP_OK) err = nvs_set_i32(nvs, "hbHour", c.hbHour);
 
     if (err == ESP_OK) err = nvs_set_u8(nvs, "netLed", c.netLedEnabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "callNotify", c.callNotifyEnabled ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_u8(nvs, "dataEn", c.dataEnabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "roamEn", c.roamingEnabled ? 1 : 0);
     if (err == ESP_OK) err = write_str(nvs, "apn", c.apn);
     if (err == ESP_OK) err = write_str(nvs, "opPlmn", c.operatorPlmn);
     if (err == ESP_OK) err = write_str(nvs, "phoneNum", c.phoneNumber);
@@ -1327,26 +1362,32 @@ esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TAS
     return err;
 }
 
-esp_err_t idf_config_save_sim(bool data_enabled, const std::string& apn,
-                              const std::string& operator_plmn)
+esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std::string& apn,
+                              const std::string& operator_plmn, const std::string& phone_number)
 {
     std::string next_apn = apn;
     std::string next_operator = operator_plmn;
+    std::string next_phone = phone_number;
     limit_utf8_bytes(next_apn, 96);
     limit_utf8_bytes(next_operator, 16);
+    limit_utf8_bytes(next_phone, 64);
 
     nvs_handle_t nvs = 0;
     esp_err_t err = begin_field_save(&nvs);
     if (err != ESP_OK) return err;
     if (err == ESP_OK) err = nvs_set_u8(nvs, "dataEn", data_enabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "roamEn", roaming_enabled ? 1 : 0);
     if (err == ESP_OK) err = write_str(nvs, "apn", next_apn);
     if (err == ESP_OK) err = write_str(nvs, "opPlmn", next_operator);
+    if (err == ESP_OK) err = write_str(nvs, "phoneNum", next_phone);
     err = commit_field_save(nvs, err, "蜂窝设置");
     if (err == ESP_OK) {
         xSemaphoreTake(s_config_mutex, portMAX_DELAY);
         s_config.dataEnabled = data_enabled;
+        s_config.roamingEnabled = roaming_enabled;
         s_config.apn = next_apn;
         s_config.operatorPlmn = next_operator;
+        s_config.phoneNumber = next_phone;
         xSemaphoreGive(s_config_mutex);
     }
     xSemaphoreGive(s_persist_mutex);
@@ -1418,11 +1459,13 @@ IdfConfigWebView idf_config_get_web_view(void)
     view.hbEnabled = s_config.hbEnabled;
     view.hbHour = s_config.hbHour;
     view.dataEnabled = s_config.dataEnabled;
+    view.roamingEnabled = s_config.roamingEnabled;
     view.apn = s_config.apn;
     view.phoneNumber = s_config.phoneNumber;
     view.operatorPlmn = s_config.operatorPlmn;
     view.kaProfile = s_config.kaProfile;
     view.netLedEnabled = s_config.netLedEnabled;
+    view.callNotifyEnabled = s_config.callNotifyEnabled;
     view.emailConfigured = email_configured_locked();
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         view.pushChannels[i] = s_config.pushChannels[i];
@@ -1504,6 +1547,7 @@ IdfSimSettingsView idf_config_get_sim_settings_view(void)
     if (ensure_config_mutex() != ESP_OK) return view;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
     view.dataEnabled = s_config.dataEnabled;
+    view.roamingEnabled = s_config.roamingEnabled;
     view.apn = s_config.apn;
     view.operatorPlmn = s_config.operatorPlmn;
     xSemaphoreGive(s_config_mutex);
@@ -1609,6 +1653,15 @@ bool idf_config_net_led_enabled(void)
     if (ensure_config_mutex() != ESP_OK) return true;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
     bool on = s_config.netLedEnabled;
+    xSemaphoreGive(s_config_mutex);
+    return on;
+}
+
+bool idf_config_call_notify_enabled(void)
+{
+    if (ensure_config_mutex() != ESP_OK) return true;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    bool on = s_config.callNotifyEnabled;
     xSemaphoreGive(s_config_mutex);
     return on;
 }
