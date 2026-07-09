@@ -29,6 +29,7 @@
 #include "idf_config.h"
 #include "idf_inbox.h"
 #include "idf_log.h"
+#include "idf_modem.h"
 #include "idf_wifi.h"
 #include "mbedtls/base64.h"
 #include "mbedtls/ctr_drbg.h"
@@ -301,6 +302,13 @@ static std::string trim(std::string value)
     return value.substr(start, end - start);
 }
 
+static std::string local_phone_number()
+{
+    IdfModemStatus modem = idf_modem_get_status();
+    if (!modem.phone.empty()) return modem.phone;
+    return idf_config_get_status_view().phoneNumber;
+}
+
 static bool parse_push_channel_token(const std::string& value, uint8_t& channel)
 {
     if (value.empty()) return false;
@@ -539,11 +547,12 @@ static bool bark_reserved_param(const std::string& key)
 }
 
 static std::string apply_push_placeholders(const std::string& value, const std::string& sender,
-                                           const std::string& text, const std::string& timestamp)
+                                           const std::string& text, const std::string& timestamp,
+                                           const std::string& receiver)
 {
     // 单次扫描替换，避免发送者/内容里出现的 {message} 等字面量被二次展开
     std::string out;
-    out.reserve(value.size() + text.size());
+    out.reserve(value.size() + text.size() + receiver.size());
     size_t pos = 0;
     while (pos < value.size()) {
         size_t brace = value.find('{', pos);
@@ -555,6 +564,8 @@ static std::string apply_push_placeholders(const std::string& value, const std::
         if (value.compare(brace, 8, "{sender}") == 0) { out += sender; pos = brace + 8; }
         else if (value.compare(brace, 9, "{message}") == 0) { out += text; pos = brace + 9; }
         else if (value.compare(brace, 11, "{timestamp}") == 0) { out += timestamp; pos = brace + 11; }
+        else if (value.compare(brace, 10, "{receiver}") == 0) { out += receiver; pos = brace + 10; }
+        else if (value.compare(brace, 14, "{local_number}") == 0) { out += receiver; pos = brace + 14; }
         else { out += '{'; pos = brace + 1; }
     }
     return out;
@@ -562,7 +573,7 @@ static std::string apply_push_placeholders(const std::string& value, const std::
 
 static void append_bark_params(std::string& json, const std::string& params,
                                const std::string& sender, const std::string& text,
-                               const std::string& timestamp)
+                               const std::string& timestamp, const std::string& receiver)
 {
     std::string spec = trim(params);
     if (!spec.empty() && spec[0] == '?') spec.erase(0, 1);
@@ -585,7 +596,7 @@ static void append_bark_params(std::string& json, const std::string& params,
         }
 
         std::string value = eq == std::string::npos ? "1" : url_decode_component(item.substr(eq + 1));
-        value = apply_push_placeholders(trim(value), sender, text, timestamp);
+        value = apply_push_placeholders(trim(value), sender, text, timestamp, receiver);
         json += ",";
         json += "\"";
         json_escape_append(json, key);
@@ -1247,9 +1258,14 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
     std::string sender = sender_raw ? sender_raw : "";
     std::string text = text_raw ? text_raw : "";
     std::string timestamp = timestamp_raw ? timestamp_raw : "";
+    std::string receiver = notify ? std::string() : local_phone_number();
     std::string sender_json = json_escape(sender);
     std::string text_json = json_escape(text);
     std::string ts_json = json_escape(timestamp);
+    std::string receiver_json = json_escape(receiver);
+    std::string receiver_line_json = receiver.empty() ? std::string() : ("\\n本机号码: " + receiver_json);
+    std::string receiver_block_json = receiver.empty() ? std::string() : ("\\n\\n本机号码: " + receiver_json);
+    std::string receiver_html_json = receiver.empty() ? std::string() : ("<br><b>本机号码:</b> " + json_escape(html_escape(receiver)));
     std::string time_line_json = "\\n时间: " + ts_json;
     std::string time_block_json = "\\n\\n时间: " + ts_json;
     std::string time_html_json = "<br><b>时间:</b> " + ts_json;
@@ -1264,7 +1280,8 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
     switch (channel.type) {
         case PUSH_TYPE_POST_JSON:
             url = channel.url;
-            body = "{\"sender\":\"" + sender_json + "\",\"message\":\"" + text_json + "\",\"timestamp\":\"" + ts_json + "\"}";
+            body = "{\"sender\":\"" + sender_json + "\",\"receiver\":\"" + receiver_json +
+                   "\",\"message\":\"" + text_json + "\",\"timestamp\":\"" + ts_json + "\"}";
             break;
         case PUSH_TYPE_BARK: {
             BarkTarget bark = bark_target_from_channel(channel);
@@ -1277,16 +1294,17 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
             }
             json_prop(body, "title", title);
             body += ",";
-            json_prop(body, "body", text + "\n\n时间: " + timestamp);
-            append_bark_params(body, channel.key2, sender, text, timestamp);
+            json_prop(body, "body", text + (receiver.empty() ? std::string() : ("\n\n本机号码: " + receiver)) +
+                                   "\n\n时间: " + timestamp);
+            append_bark_params(body, channel.key2, sender, text, timestamp, receiver);
             body += "}";
             break;
         }
         case PUSH_TYPE_GET:
             method = "GET";
             url = channel.url + (channel.url.find('?') == std::string::npos ? "?" : "&") +
-                  "sender=" + url_encode(sender) + "&message=" + url_encode(text) +
-                  "&timestamp=" + url_encode(timestamp);
+                  "sender=" + url_encode(sender) + "&receiver=" + url_encode(receiver) +
+                  "&message=" + url_encode(text) + "&timestamp=" + url_encode(timestamp);
             break;
         case PUSH_TYPE_DINGTALK: {
             url = channel.url;
@@ -1301,7 +1319,7 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
                 ? ("{\"msgtype\":\"text\",\"text\":{\"content\":\"" + title_json + "\\n" +
                    text_json + time_line_json + "\"}}")
                 : ("{\"msgtype\":\"text\",\"text\":{\"content\":\"短信通知\\n发送者: " +
-                   sender_json + "\\n内容: " + text_json + time_line_json + "\"}}");
+                   sender_json + receiver_line_json + "\\n内容: " + text_json + time_line_json + "\"}}");
             break;
         }
         case PUSH_TYPE_PUSHPLUS: {
@@ -1312,7 +1330,7 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
             std::string sender_html = json_escape(html_escape(sender));
             std::string pp_content = notify
                 ? (text_html + time_html_json)
-                : ("<b>发送者:</b> " + sender_html + time_html_json + "<br><b>内容:</b><br>" + text_html);
+                : ("<b>发送者:</b> " + sender_html + receiver_html_json + time_html_json + "<br><b>内容:</b><br>" + text_html);
             body = "{\"token\":\"" + json_escape(channel.key1) + "\",\"title\":\"" + title_json +
                    "\",\"content\":\"" + pp_content + "\",\"channel\":\"" + push_channel + "\"}";
             break;
@@ -1334,13 +1352,15 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
             content_type = "application/x-www-form-urlencoded";
             std::string sc_desp = notify
                 ? ("**时间:** " + timestamp + "\n\n" + text)
-                : ("**发送者:** " + sender + "\n\n**时间:** " + timestamp + "\n\n**内容:**\n\n" + text);
+                : ("**发送者:** " + sender +
+                   (receiver.empty() ? std::string() : ("\n\n**本机号码:** " + receiver)) +
+                   "\n\n**时间:** " + timestamp + "\n\n**内容:**\n\n" + text);
             body = "title=" + url_encode(title) + "&desp=" + url_encode(sc_desp);
             break;
         }
         case PUSH_TYPE_CUSTOM:
             url = channel.url;
-            body = apply_push_placeholders(channel.customBody, sender_json, text_json, ts_json);
+            body = apply_push_placeholders(channel.customBody, sender_json, text_json, ts_json, receiver_json);
             break;
         case PUSH_TYPE_FEISHU:
             url = channel.url;
@@ -1355,14 +1375,14 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
                 ? ("\"msg_type\":\"text\",\"content\":{\"text\":\"" + title_json + "\\n" +
                    text_json + time_line_json + "\"}}")
                 : ("\"msg_type\":\"text\",\"content\":{\"text\":\"短信通知\\n发送者: " +
-                   sender_json + "\\n内容: " + text_json + time_line_json + "\"}}");
+                   sender_json + receiver_line_json + "\\n内容: " + text_json + time_line_json + "\"}}");
             break;
         case PUSH_TYPE_GOTIFY:
             url = channel.url;
             if (!url.empty() && url.back() != '/') url += "/";
             url += "message?token=" + url_encode(channel.key1);
             body = "{\"title\":\"" + title_json + "\",\"message\":\"" + text_json +
-                   time_block_json + "\",\"priority\":5}";
+                   receiver_block_json + time_block_json + "\",\"priority\":5}";
             break;
         case PUSH_TYPE_TELEGRAM: {
             std::string base = channel.url.empty() ? "https://api.telegram.org" : channel.url;
@@ -1372,7 +1392,7 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
                 ? ("{\"chat_id\":\"" + json_escape(channel.key1) + "\",\"text\":\"" + title_json + "\\n" +
                    text_json + time_line_json + "\"}")
                 : ("{\"chat_id\":\"" + json_escape(channel.key1) + "\",\"text\":\"短信通知\\n发送者: " +
-                   sender_json + "\\n内容: " + text_json + time_line_json + "\"}");
+                   sender_json + receiver_line_json + "\\n内容: " + text_json + time_line_json + "\"}");
             break;
         }
         default:
@@ -1550,6 +1570,7 @@ static bool process_forward_one()
     }
 
     const IdfPushForwardView cfg = idf_config_get_push_forward_view();
+    const std::string receiver = local_phone_number();
     ForwardDecision fd = eval_forward_rules(cfg.forwardRules, job.sender, job.text);
     if (fd.matched && fd.drop) {
         idf_logf("转发规则命中：丢弃短信 id=%u", static_cast<unsigned>(job.inboxId));
@@ -1617,6 +1638,10 @@ static bool process_forward_one()
             subject += utf8_truncate(job.text, 48);
             std::string body = "来自：";
             body += job.sender;
+            if (!receiver.empty()) {
+                body += "，本机号码：";
+                body += receiver;
+            }
             if (!job.timestamp.empty()) {
                 body += "，时间：";
                 body += job.timestamp;

@@ -8,6 +8,7 @@ idf_component_register(
     idf_config
     idf_inbox
     idf_logbuf
+    idf_modem
     idf_wifi
     lwip
     mbedtls
