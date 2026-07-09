@@ -60,6 +60,16 @@ jobs:
             0x10000 build/idf/sms_forwarding_idf.bin
           ls -l dist/
 
+      - name: Compute release checksums
+        id: checksums
+        shell: bash
+        run: |
+          V=${{ steps.version.outputs.version }}
+          OTA_FILE="dist/sms_forwarder_ota_v${V}.bin"
+          FULL_FILE="dist/sms_forwarder_full_v${V}.bin"
+          echo "ota_sha256=$(sha256sum "$OTA_FILE" | awk '{print toupper($1)}')" >> "$GITHUB_OUTPUT"
+          echo "full_sha256=$(sha256sum "$FULL_FILE" | awk '{print toupper($1)}')" >> "$GITHUB_OUTPUT"
+
       - name: Upload firmware artifact (7-day retention)
         uses: actions/upload-artifact@v4
         with:
@@ -104,3 +114,10 @@ jobs:
             ```
 
             OTA 升级：打开设备网页的「固件升级」页，上传 `sms_forwarder_ota_v${{ steps.version.outputs.version }}.bin`。
+
+            SHA-256：
+
+            | 文件 | SHA-256 |
+            | --- | --- |
+            | `sms_forwarder_ota_v${{ steps.version.outputs.version }}.bin` | `${{ steps.checksums.outputs.ota_sha256 }}` |
+            | `sms_forwarder_full_v${{ steps.version.outputs.version }}.bin` | `${{ steps.checksums.outputs.full_sha256 }}` |
