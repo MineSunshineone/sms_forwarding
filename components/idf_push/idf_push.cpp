@@ -31,12 +31,16 @@
 #include "idf_log.h"
 #include "idf_modem.h"
 #include "idf_wifi.h"
+#include "esp_idf_version.h"
 #include "mbedtls/base64.h"
-#include "mbedtls/ctr_drbg.h"
 #include "mbedtls/error.h"
 #include "mbedtls/md.h"
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/ssl.h"
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/entropy.h"
+#endif
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
 
@@ -746,16 +750,21 @@ struct SmtpConn {
     mbedtls_net_context net;
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
+    // MbedTLS 3.x (IDF 5.x)：需要本地 entropy/ctr_drbg 作为 TLS 随机源
     mbedtls_ctr_drbg_context ctrDrbg;
     mbedtls_entropy_context entropy;
+#endif
 
     SmtpConn()
     {
         mbedtls_net_init(&net);
         mbedtls_ssl_init(&ssl);
         mbedtls_ssl_config_init(&conf);
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
         mbedtls_ctr_drbg_init(&ctrDrbg);
         mbedtls_entropy_init(&entropy);
+#endif
     }
 };
 
@@ -771,8 +780,10 @@ static void smtp_conn_close(SmtpConn& conn)
     }
     mbedtls_ssl_free(&conn.ssl);
     mbedtls_ssl_config_free(&conn.conf);
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
     mbedtls_ctr_drbg_free(&conn.ctrDrbg);
     mbedtls_entropy_free(&conn.entropy);
+#endif
     if (conn.sock >= 0) {
         close(conn.sock);
         conn.sock = -1;
@@ -862,6 +873,8 @@ static bool smtp_tcp_connect(const std::string& host, int port, SmtpConn& conn)
 
 static bool smtp_starttls_upgrade(SmtpConn& conn, const std::string& host)
 {
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
+    // IDF 5.x / MbedTLS 3.x：显式初始化 CTR-DRBG，并通过 conf_rng 注入
     const char* pers = "sms-smtp-starttls";
     int ret = mbedtls_ctr_drbg_seed(&conn.ctrDrbg, mbedtls_entropy_func, &conn.entropy,
                                     reinterpret_cast<const unsigned char*>(pers), strlen(pers));
@@ -869,13 +882,19 @@ static bool smtp_starttls_upgrade(SmtpConn& conn, const std::string& host)
         idf_logf("STARTTLS随机源初始化失败: -0x%04x", -ret);
         return false;
     }
+#else
+    // IDF 6.x / MbedTLS 4.x：PSA Crypto RNG 全局生效，ctr_drbg/conf_rng 已移除
+    int ret = 0;
+#endif
     ret = mbedtls_ssl_config_defaults(&conn.conf, MBEDTLS_SSL_IS_CLIENT,
                                       MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
     if (ret != 0) {
         idf_logf("STARTTLS配置初始化失败: -0x%04x", -ret);
         return false;
     }
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
     mbedtls_ssl_conf_rng(&conn.conf, mbedtls_ctr_drbg_random, &conn.ctrDrbg);
+#endif
     mbedtls_ssl_conf_authmode(&conn.conf, MBEDTLS_SSL_VERIFY_REQUIRED);
     if (esp_crt_bundle_attach(&conn.conf) != ESP_OK) {
         idf_log_line("STARTTLS证书包挂载失败");
