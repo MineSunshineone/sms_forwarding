@@ -349,8 +349,9 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
             idf_logf("WiFi 已连接，IP=" IPSTR, IP2STR(&event->ip_info.ip));
         }
         start_sntp_once();
-        // 同手机：成功连上的网络自动记住(任务内部去重，已知网络秒退不写 NVS)
-        if (xTaskCreate(wifi_remember_task, "idf_wifi_mem", 4096, nullptr, 2, nullptr) != pdPASS) {
+        // 同手机：成功连上的网络自动记住(任务内部去重，已知网络秒退不写 NVS)。
+        // 记忆路径会处理历史 WiFi 临时数组并保存 NVS，4KB 栈不足，使用独立 8KB 栈避免栈保护重启。
+        if (xTaskCreate(wifi_remember_task, "idf_wifi_mem", 8192, nullptr, 2, nullptr) != pdPASS) {
             ESP_LOGW(TAG, "WiFi 记忆任务创建失败，本次连接不自动记入历史列表");
         }
         if (s_wifi_event_group) {
