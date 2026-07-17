@@ -84,5 +84,18 @@ jobs:
 
             | 文件 | 用途 |
             | --- | --- |
-            | `sms_forwarder_ota_v${{ steps.version.outputs.version }}.bin` | 网页「固件升级」页直接上传（OTA，无需数据线） |
-            | `sms_forwarder_full_v${{ steps.version.outputs.version }}.bin` | 整机烧录：`esptool.py --chip esp32c3 write_flash 0x0 <文件>` |
+            | `sms_forwarder_full_v${{ steps.version.outputs.version }}.bin` | 首次刷机、救砖、分区变化后重刷；从地址 `0x0` 整机刷写 |
+            | `sms_forwarder_ota_v${{ steps.version.outputs.version }}.bin` | 设备网页「固件升级」页直接上传（OTA，无需数据线） |
+
+            普通用户不需要下载源码，也不需要安装 Python/ESP-IDF。首次刷机推荐使用乐鑫官方 GUI 工具：
+
+            - Windows：[Flash Download Tool](https://docs.espressif.com/projects/esp-test-tools/en/latest/esp32c3/production_stage/tools/flash_download_tool.html)，选择 `ESP32-C3`，把 `sms_forwarder_full_v${{ steps.version.outputs.version }}.bin` 填到地址 `0x0`，选择实际串口和 `460800` 波特率后开始刷写。
+            - Chrome / Edge：[ESP Launchpad](https://espressif.github.io/esp-launchpad/) 自定义固件刷写，选择 `sms_forwarder_full_v${{ steps.version.outputs.version }}.bin`，地址填 `0x0`。
+
+            已经安装 Python/esptool 的高级用户，也可以用命令行刷完整包（按实际串口号替换 `COM5`）：
+
+            ```powershell
+            esptool.py --chip esp32c3 -p COM5 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB 0x0 sms_forwarder_full_v${{ steps.version.outputs.version }}.bin
+            ```
+
+            OTA 升级：打开设备网页的「固件升级」页，上传 `sms_forwarder_ota_v${{ steps.version.outputs.version }}.bin`。不要把 `full` 包上传到网页 OTA，也不要把 `ota` 包从 `0x0` 当整机镜像刷写。
