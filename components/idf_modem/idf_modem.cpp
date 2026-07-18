@@ -758,6 +758,58 @@ static std::string parse_apn(const std::string& resp)
     }
 }
 
+// 部分模组/卡会把国际 TOA 字节 0x91 误解成 BCD 数字，导致 CNUM 号码出现
+// "+19..." 前缀，例如 +1944756... 实际应为 +44756...。这里只在 "19" 后
+// 紧跟常见国家/地区码时剥离，避免误伤真实 NANP 号码。
+static std::string normalize_msisdn(std::string phone)
+{
+    size_t start = 0;
+    while (start < phone.size() && isspace(static_cast<unsigned char>(phone[start]))) ++start;
+    size_t end = phone.size();
+    while (end > start && isspace(static_cast<unsigned char>(phone[end - 1]))) --end;
+    if (start >= end) return {};
+    phone = phone.substr(start, end - start);
+
+    bool had_plus = !phone.empty() && phone[0] == '+';
+    std::string digits;
+    digits.reserve(phone.size());
+    for (size_t i = had_plus ? 1 : 0; i < phone.size(); ++i) {
+        unsigned char ch = static_cast<unsigned char>(phone[i]);
+        if (isdigit(ch)) digits += static_cast<char>(ch);
+        else if (!isspace(ch) && ch != '-' && ch != '(' && ch != ')') {
+            return phone;
+        }
+    }
+    if (digits.size() < 8) return phone;
+    if (had_plus && digits.size() == 11 && digits[0] == '1') {
+        return std::string("+") + digits;
+    }
+
+    static const char* kCountryCodes[] = {
+        "44", "86", "33", "49", "81", "61", "91", "39", "34", "82", "65",
+        "852", "886", "853", "855", "856", "60", "62", "63", "66", "84",
+        "90", "971", "966", "974", "973", "968", "965", "962", "961",
+        "20", "27", "234", "254", "255", "256", "233", "212",
+        "7", "380", "48", "40", "36", "30", "31", "32",
+        "41", "43", "45", "46", "47", "351", "352", "353", "354", "358",
+        "420", "421", "370", "371", "372", "373", "374", "375", "376",
+        "52", "55", "54", "56", "57", "51", "58",
+        "1",
+    };
+    if (digits.rfind("19", 0) == 0) {
+        std::string rest = digits.substr(2);
+        for (const char* cc : kCountryCodes) {
+            size_t n = strlen(cc);
+            if (rest.size() < n + 6) continue;
+            if (rest.compare(0, n, cc) != 0) continue;
+            if (strcmp(cc, "1") == 0) continue;
+            return std::string("+") + rest;
+        }
+    }
+    if (had_plus) return std::string("+") + digits;
+    return phone;
+}
+
 static std::string parse_cnum_phone(const std::string& resp)
 {
     size_t p = resp.find("+CNUM:");
@@ -769,7 +821,8 @@ static std::string parse_cnum_phone(const std::string& resp)
     after_alpha = line.find('"', after_alpha + 1);
     if (after_alpha == std::string::npos) return {};
     std::string phone = first_quoted(line, after_alpha + 1);
-    return phone.empty() ? alpha : phone;
+    if (phone.empty()) phone = alpha;
+    return normalize_msisdn(phone);
 }
 
 static bool starts_with(const std::string& text, const char* prefix)
