@@ -77,7 +77,7 @@
     .sidebar-footer .btn { width: 100%; }
 
     /* Main */
-    .main { margin-left: var(--sidebar-w); flex: 1; padding: 24px 26px; max-width: 1480px; width: 100%; }
+    .main { margin-left: var(--sidebar-w); flex: 1; min-width: 0; padding: 24px 26px; max-width: 1480px; width: auto; }
     .panel form { max-width: 780px; }
     .panel.col1 { max-width: 780px; }
     /* 流动(masonry)布局：两列各自独立排列，卡片间距统一 14px；左右不强制对齐高度起点，消除"为对齐右列而产生的硬间隔" */
