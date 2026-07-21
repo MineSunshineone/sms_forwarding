@@ -267,7 +267,7 @@ start preview\index.html
 已经安装 Python/esptool 的用户，也可以直接用命令行刷完整包：
 
 ```powershell
-esptool.py --chip esp32c3 -p COM5 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB 0x0 sms_forwarder_full_v1.0.9-fork.4.bin
+esptool.py --chip esp32c3 -p COM5 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB 0x0 sms_forwarder_full_v1.10.bin
 ```
 
 其中 `COM5` 和文件名按实际情况替换。`esptool.py` 是电脑端刷写工具，不在固件里；没有 Python 环境时请优先使用上面的 GUI 工具。
