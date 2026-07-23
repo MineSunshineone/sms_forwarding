@@ -1,6 +1,7 @@
 #include "idf_config.h"
 
 #include <algorithm>
+#include <cstring>
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
