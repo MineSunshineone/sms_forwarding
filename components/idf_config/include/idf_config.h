@@ -83,6 +83,9 @@ struct IdfConfig {
     int rebootHour = 4;
     bool hbEnabled = false;
     int hbHour = 9;
+    bool smsHealthEnabled = false;
+    int smsHealthHour = 10;
+    bool smsHealthNotify = true;
 
     bool netLedEnabled = true;  // 模组 NET 指示灯(AT+MNETLIGHT)，关闭后重启依然保持
     bool callNotifyEnabled = true;  // 来电通知：有来电时把主叫号码按短信相同的通道推送
@@ -125,7 +128,9 @@ esp_err_t idf_config_save_keepalive(bool enabled, int interval_days, uint8_t act
                                     const std::string& target, const std::string& url,
                                     const std::string& profile);
 esp_err_t idf_config_save_system_schedule(bool reboot_enabled, int reboot_hour,
-                                          bool hb_enabled, int hb_hour);
+                                          bool hb_enabled, int hb_hour,
+                                          bool sms_health_enabled, int sms_health_hour,
+                                          bool sms_health_notify);
 esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TASKS]);
 esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std::string& apn,
                               const std::string& operator_plmn, const std::string& phone_number);
@@ -180,6 +185,9 @@ struct IdfConfigWebView {
     int rebootHour = 4;
     bool hbEnabled = false;
     int hbHour = 9;
+    bool smsHealthEnabled = false;
+    int smsHealthHour = 10;
+    bool smsHealthNotify = true;
     bool dataEnabled = false;
     bool roamingEnabled = true;
     std::string apn;
@@ -283,6 +291,9 @@ struct IdfSchedulerView {
     int rebootHour = 4;
     bool hbEnabled = false;
     int hbHour = 9;
+    bool smsHealthEnabled = false;
+    int smsHealthHour = 10;
+    bool smsHealthNotify = true;
     bool emailEnabled = true;
     IdfSchedTask schedTasks[IDF_MAX_SCHED_TASKS];
 };

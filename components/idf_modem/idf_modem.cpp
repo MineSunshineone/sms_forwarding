@@ -1868,6 +1868,72 @@ static bool configure_sms_and_registration(void)
     return sms_ready;
 }
 
+static bool response_has_compact(std::string response, const char* expected)
+{
+    response.erase(std::remove_if(response.begin(), response.end(), [](unsigned char ch) {
+        return isspace(ch);
+    }), response.end());
+    return response.find(expected) != std::string::npos;
+}
+
+static void query_sms_receive_config(bool& pdu, bool& cnmi)
+{
+    std::string resp;
+    pdu = send_ok("AT+CMGF?", 1200, &resp) && response_has_compact(resp, "+CMGF:0");
+    cnmi = send_ok("AT+CNMI?", 1200, &resp) &&
+           response_has_compact(resp, "+CNMI:2,1,0,0,0");
+}
+
+bool idf_modem_sms_health_check(std::string& summary)
+{
+    summary.clear();
+    if (!idf_modem_get_status().atReady) {
+        idf_modem_request_reset(true);
+        summary = "模组 AT 未就绪，已请求模组硬重启";
+        idf_logf("每日短信体检异常: %s", summary.c_str());
+        return false;
+    }
+
+    std::string resp;
+    int stat = -1;
+    bool registered = send_ok("AT+CEREG?", 1200, &resp) && parse_cereg(resp, stat) &&
+                      (stat == 1 || stat == 5);
+    bool pdu = false;
+    bool cnmi = false;
+    query_sms_receive_config(pdu, cnmi);
+    bool storage = select_sms_storage();
+    bool initially_ok = registered && pdu && cnmi && storage;
+
+    if (!pdu || !cnmi || !storage) {
+        configure_sms_and_registration();
+        stat = -1;
+        registered = send_ok("AT+CEREG?", 1200, &resp) && parse_cereg(resp, stat) &&
+                     (stat == 1 || stat == 5);
+        query_sms_receive_config(pdu, cnmi);
+        storage = select_sms_storage();
+    }
+
+    bool final_ok = registered && pdu && cnmi && storage;
+    char state[160];
+    snprintf(state, sizeof(state), "注册=%s，PDU=%s，CNMI=%s，存储=%s（不含运营商端到端投递）",
+             registered ? "正常" : "异常", pdu ? "正常" : "异常", cnmi ? "正常" : "异常",
+             storage ? "正常" : "异常");
+
+    if (initially_ok) {
+        summary = std::string("正常：") + state;
+        idf_logf("每日短信体检通过: %s", summary.c_str());
+        return true;
+    }
+    if (final_ok) {
+        summary = std::string("发现异常，已修复：") + state;
+    } else {
+        idf_modem_request_reset(true);
+        summary = std::string("异常未恢复，已请求模组硬重启：") + state;
+    }
+    idf_logf("每日短信体检异常: %s", summary.c_str());
+    return false;
+}
+
 // 查询 SIM 是否就绪：AT+CPIN? 返回 +CPIN: READY 视为有卡可用；无卡/卡故障时模组回
 // +CME ERROR(10=无卡,13=卡故障)，send_ok 返回 false。用于运行中热插拔检测。
 static bool query_sim_ready(void)

@@ -214,6 +214,7 @@ static void normalize_config(IdfConfig& c)
     sanitize_mdns_host(c.mdnsHost);
     c.rebootHour = clamp_int(c.rebootHour, 0, 23);
     c.hbHour = clamp_int(c.hbHour, 0, 23);
+    c.smsHealthHour = clamp_int(c.smsHealthHour, 0, 23);
 
     limit_utf8_bytes(c.apn, 96);
     limit_utf8_bytes(c.operatorPlmn, 16);
@@ -510,6 +511,9 @@ esp_err_t idf_config_load(void)
         next.rebootHour = read_i32(nvs, "rbHour", 4);
         next.hbEnabled = read_bool(nvs, "hbEn", false);
         next.hbHour = read_i32(nvs, "hbHour", 9);
+        next.smsHealthEnabled = read_bool(nvs, "smsHlthEn", false);
+        next.smsHealthHour = read_i32(nvs, "smsHlthHr", 10);
+        next.smsHealthNotify = read_bool(nvs, "smsHlthNt", true);
 
         next.netLedEnabled = read_bool(nvs, "netLed", true);
         next.callNotifyEnabled = read_bool(nvs, "callNotify", true);
@@ -640,6 +644,9 @@ std::string idf_config_export_text(bool full_export)
     append_kv_i(out, "rebootHour", c.rebootHour);
     append_kv_i(out, "hbEnabled", c.hbEnabled ? 1 : 0);
     append_kv_i(out, "hbHour", c.hbHour);
+    append_kv_i(out, "smsHealthEnabled", c.smsHealthEnabled ? 1 : 0);
+    append_kv_i(out, "smsHealthHour", c.smsHealthHour);
+    append_kv_i(out, "smsHealthNotify", c.smsHealthNotify ? 1 : 0);
 
     append_kv_i(out, "kaEnabled", c.kaEnabled ? 1 : 0);
     append_kv_i(out, "kaIntervalDays", c.kaIntervalDays);
@@ -733,6 +740,9 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
     else if (key == "rebootHour") import_int_field(c.rebootHour, value);
     else if (key == "hbEnabled") c.hbEnabled = bool_from_text(value);
     else if (key == "hbHour") import_int_field(c.hbHour, value);
+    else if (key == "smsHealthEnabled") c.smsHealthEnabled = bool_from_text(value);
+    else if (key == "smsHealthHour") import_int_field(c.smsHealthHour, value);
+    else if (key == "smsHealthNotify") c.smsHealthNotify = bool_from_text(value);
     else if (key == "kaEnabled") c.kaEnabled = bool_from_text(value);
     else if (key == "kaIntervalDays") import_int_field(c.kaIntervalDays, value);
     else if (key == "kaAction") import_u8_field(c.kaAction, value);
@@ -1007,6 +1017,9 @@ static esp_err_t save_config_to_nvs(const IdfConfig& c)
     if (err == ESP_OK) err = nvs_set_i32(nvs, "rbHour", c.rebootHour);
     if (err == ESP_OK) err = nvs_set_u8(nvs, "hbEn", c.hbEnabled ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_i32(nvs, "hbHour", c.hbHour);
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "smsHlthEn", c.smsHealthEnabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_i32(nvs, "smsHlthHr", c.smsHealthHour);
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "smsHlthNt", c.smsHealthNotify ? 1 : 0);
 
     if (err == ESP_OK) err = nvs_set_u8(nvs, "netLed", c.netLedEnabled ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_u8(nvs, "callNotify", c.callNotifyEnabled ? 1 : 0);
@@ -1522,10 +1535,13 @@ esp_err_t idf_config_save_keepalive(bool enabled, int interval_days, uint8_t act
 }
 
 esp_err_t idf_config_save_system_schedule(bool reboot_enabled, int reboot_hour,
-                                          bool hb_enabled, int hb_hour)
+                                          bool hb_enabled, int hb_hour,
+                                          bool sms_health_enabled, int sms_health_hour,
+                                          bool sms_health_notify)
 {
     int next_reboot_hour = clamp_int(reboot_hour, 0, 23);
     int next_hb_hour = clamp_int(hb_hour, 0, 23);
+    int next_sms_health_hour = clamp_int(sms_health_hour, 0, 23);
 
     nvs_handle_t nvs = 0;
     esp_err_t err = begin_field_save(&nvs);
@@ -1534,6 +1550,9 @@ esp_err_t idf_config_save_system_schedule(bool reboot_enabled, int reboot_hour,
     if (err == ESP_OK) err = nvs_set_i32(nvs, "rbHour", next_reboot_hour);
     if (err == ESP_OK) err = nvs_set_u8(nvs, "hbEn", hb_enabled ? 1 : 0);
     if (err == ESP_OK) err = nvs_set_i32(nvs, "hbHour", next_hb_hour);
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "smsHlthEn", sms_health_enabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_i32(nvs, "smsHlthHr", next_sms_health_hour);
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "smsHlthNt", sms_health_notify ? 1 : 0);
     err = commit_field_save(nvs, err, "系统定时");
     if (err == ESP_OK) {
         xSemaphoreTake(s_config_mutex, portMAX_DELAY);
@@ -1541,6 +1560,9 @@ esp_err_t idf_config_save_system_schedule(bool reboot_enabled, int reboot_hour,
         s_config.rebootHour = next_reboot_hour;
         s_config.hbEnabled = hb_enabled;
         s_config.hbHour = next_hb_hour;
+        s_config.smsHealthEnabled = sms_health_enabled;
+        s_config.smsHealthHour = next_sms_health_hour;
+        s_config.smsHealthNotify = sms_health_notify;
         xSemaphoreGive(s_config_mutex);
     }
     xSemaphoreGive(s_persist_mutex);
@@ -1702,6 +1724,9 @@ IdfConfigWebView idf_config_get_web_view(void)
     view.rebootHour = s_config.rebootHour;
     view.hbEnabled = s_config.hbEnabled;
     view.hbHour = s_config.hbHour;
+    view.smsHealthEnabled = s_config.smsHealthEnabled;
+    view.smsHealthHour = s_config.smsHealthHour;
+    view.smsHealthNotify = s_config.smsHealthNotify;
     view.dataEnabled = s_config.dataEnabled;
     view.roamingEnabled = s_config.roamingEnabled;
     view.apn = s_config.apn;
@@ -1869,6 +1894,9 @@ IdfSchedulerView idf_config_get_scheduler_view(void)
     view.rebootHour = s_config.rebootHour;
     view.hbEnabled = s_config.hbEnabled;
     view.hbHour = s_config.hbHour;
+    view.smsHealthEnabled = s_config.smsHealthEnabled;
+    view.smsHealthHour = s_config.smsHealthHour;
+    view.smsHealthNotify = s_config.smsHealthNotify;
     view.emailEnabled = s_config.emailEnabled;
     for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) view.schedTasks[i] = s_config.schedTasks[i];
     xSemaphoreGive(s_config_mutex);

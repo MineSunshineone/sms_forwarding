@@ -559,10 +559,14 @@ static esp_err_t send_config_json(httpd_req_t* req)
     json_prop(body, "mdnsHost", cfg.mdnsHost); body += ",";
     snprintf(buf, sizeof(buf),
              "\"tzOffsetMin\":%d,\"rebootEnabled\":%s,\"rebootHour\":%d,"
-             "\"hbEnabled\":%s,\"hbHour\":%d,\"dataEnabled\":%s,\"roamingEnabled\":%s,",
+             "\"hbEnabled\":%s,\"hbHour\":%d,"
+             "\"smsHealthEnabled\":%s,\"smsHealthHour\":%d,\"smsHealthNotify\":%s,"
+             "\"dataEnabled\":%s,\"roamingEnabled\":%s,",
              cfg.tzOffsetMin,
              cfg.rebootEnabled ? "true" : "false", cfg.rebootHour,
              cfg.hbEnabled ? "true" : "false", cfg.hbHour,
+             cfg.smsHealthEnabled ? "true" : "false", cfg.smsHealthHour,
+             cfg.smsHealthNotify ? "true" : "false",
              cfg.dataEnabled ? "true" : "false",
              cfg.roamingEnabled ? "true" : "false");
     body += buf;
@@ -1516,7 +1520,10 @@ static esp_err_t handle_save(httpd_req_t* req)
         esp_err_t err = idf_config_save_system_schedule(has_field(fields, "rebootEnabled"),
                                                         field_int(fields, "rebootHour", 4),
                                                         has_field(fields, "hbEnabled"),
-                                                        field_int(fields, "hbHour", 9));
+                                                        field_int(fields, "hbHour", 9),
+                                                        has_field(fields, "smsHealthEnabled"),
+                                                        field_int(fields, "smsHealthHour", 10),
+                                                        has_field(fields, "smsHealthNotify"));
         if (err != ESP_OK) return fail(err);
         return ok("网页保存系统定时");
     }
@@ -3054,23 +3061,23 @@ static bool start_sched_job(const IdfSchedRunView& cfg, int index, std::string& 
     return true;
 }
 
-// 心跳"上次发送日"落盘：重启会清掉内存标记，若重启恰在心跳小时内(如每日重启
-// 与心跳同小时)，不落盘会当天重复发送。每天最多写一次，NVS 磨损可忽略。
-static int64_t load_hb_last_day()
+// 每日任务的"上次执行日"落盘：重启会清掉内存标记，若重启恰在执行小时内，
+// 不落盘会当天重复执行。每个任务每天最多写一次，NVS 磨损可忽略。
+static int64_t load_daily_last_day(const char* key)
 {
     nvs_handle_t h;
     if (nvs_open("sms_state", NVS_READONLY, &h) != ESP_OK) return -1;
     uint32_t v = 0;
-    int64_t day = (nvs_get_u32(h, "hb_day", &v) == ESP_OK) ? static_cast<int64_t>(v) : -1;
+    int64_t day = (nvs_get_u32(h, key, &v) == ESP_OK) ? static_cast<int64_t>(v) : -1;
     nvs_close(h);
     return day;
 }
 
-static void store_hb_last_day(int64_t day)
+static void store_daily_last_day(const char* key, int64_t day)
 {
     nvs_handle_t h;
     if (nvs_open("sms_state", NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_u32(h, "hb_day", static_cast<uint32_t>(day));
+    nvs_set_u32(h, key, static_cast<uint32_t>(day));
     nvs_commit(h);
     nvs_close(h);
 }
@@ -3079,7 +3086,8 @@ static void scheduler_task(void*)
 {
     uint32_t last_ka_check_ms = 0;
     bool prev_ka_enabled = false;
-    int64_t hb_last_day = load_hb_last_day();
+    int64_t hb_last_day = load_daily_last_day("hb_day");
+    int64_t health_last_day = load_daily_last_day("health_day");
     int64_t rb_last_day = -1;
 
     while (true) {
@@ -3165,13 +3173,25 @@ static void scheduler_task(void*)
             // 用 > 而非 !=：NTP 回拨跨过本地午夜会让 day 变小，!= 会当天重复触发
             if (cfg.hbEnabled && hour == cfg.hbHour && day > hb_last_day) {
                 hb_last_day = day;
-                store_hb_last_day(day);
+                store_daily_last_day("hb_day", day);
                 IdfSmsStatus sms = idf_sms_get_status();
                 char body[192];
                 snprintf(body, sizeof(body), "设备运行正常。\n累计转发: %u 条\n空闲堆: %u KB",
                          static_cast<unsigned>(sms.total),
                          static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024U));
                 enqueue_maintenance_notice(cfg.tzOffsetMin, cfg.emailEnabled, "设备每日心跳", body, now);
+            }
+
+            if (cfg.smsHealthEnabled && hour == cfg.smsHealthHour &&
+                day > health_last_day && idf_modem_at_idle()) {
+                health_last_day = day;
+                store_daily_last_day("health_day", day);
+                std::string health;
+                bool health_ok = idf_modem_sms_health_check(health);
+                if (!health_ok && cfg.smsHealthNotify) {
+                    enqueue_maintenance_notice(cfg.tzOffsetMin, cfg.emailEnabled,
+                                               "设备每日短信体检异常", health, now);
+                }
             }
 
             uint64_t uptime_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);

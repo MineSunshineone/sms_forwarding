@@ -59,13 +59,17 @@
         <form action="/save" method="POST" id="systemSchedForm" class="sched-save-block">
         <input type="hidden" name="systemSchedForm" value="1">
         <div class="push-channel sys-card">
-          <div class="push-channel-header"><label class="label-inline">系统定时</label><span class="ch-summary">重启 / 心跳 · 每天固定小时</span></div>
+          <div class="push-channel-header"><label class="label-inline">系统定时</label><span class="ch-summary">重启 / 心跳 / 短信体检 · 每天固定小时</span></div>
           <div class="push-channel-body">
             <div class="form-row">
               <div class="form-group"><label class="switch-inline" style="margin-bottom:6px;"><input type="checkbox" class="switch-input" name="rebootEnabled" %RB_CHECKED%><span class="switch-slider"></span><span>每日定时重启</span></label><input class="form-input" type="number" name="rebootHour" value="%RB_HOUR%" min="0" max="23"></div>
-              <div class="form-group"><label class="switch-inline" style="margin-bottom:6px;"><input type="checkbox" class="switch-input" name="hbEnabled" %HB_CHECKED%><span class="switch-slider"></span><span>每日心跳通知（启用的推送/邮件）</span></label><input class="form-input" type="number" name="hbHour" value="%HB_HOUR%" min="0" max="23"></div>
+              <div class="form-group"><label class="switch-inline" style="margin-bottom:6px;"><input type="checkbox" class="switch-input" name="hbEnabled" %HB_CHECKED%><span class="switch-slider"></span><span>每日心跳通知</span></label><input class="form-input" type="number" name="hbHour" value="%HB_HOUR%" min="0" max="23"></div>
             </div>
-            <p class="form-hint" style="margin:0;">小时按本地时间 0-23 执行；定时重启建议放在空闲时段</p>
+            <div class="form-row">
+              <div class="form-group"><label class="switch-inline" style="margin-bottom:6px;"><input type="checkbox" class="switch-input" name="smsHealthEnabled" %SMS_HEALTH_CHECKED%><span class="switch-slider"></span><span>每日短信体检</span></label><input class="form-input" type="number" name="smsHealthHour" value="%SMS_HEALTH_HOUR%" min="0" max="23"></div>
+              <div class="form-group"><label class="switch-inline"><input type="checkbox" class="switch-input" name="smsHealthNotify" %SMS_HEALTH_NOTIFY_CHECKED%><span class="switch-slider"></span><span>发现异常时推送 / 邮件提醒</span></label></div>
+            </div>
+            <p class="form-hint" style="margin:0;">小时按本地时间 0-23 执行；体检检查注册、PDU、CNMI 和短信存储，异常时先重配复查，仍未恢复则硬重启模组。无法验证运营商是否实际投递新短信。</p>
           </div>
         </div>
         <button type="submit" class="btn btn-primary btn-block btn-save">保存系统定时</button>

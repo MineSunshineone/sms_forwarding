@@ -66,6 +66,9 @@ void idf_modem_request_status_sample(void);
 // 重申短信存储选择(CPMS MT→ME→SM)：短信任务随 CMGF/CNMI 周期重申一起调用，
 // 覆盖"模组自发复位后存储回落默认值、短信无处可存"的静默失效
 void idf_modem_reassert_sms_storage(void);
+// 每日后台短信体检：检查注册、PDU、CNMI 与短信存储，配置异常时自动重申。
+// 只能验证本机短信栈，无法证明运营商已实际投递一条新短信。
+bool idf_modem_sms_health_check(std::string& summary);
 // 启用/切换/禁用 eSIM Profile 后调用：清除缓存的卡相关身份(号码/ICCID/IMSI/运营商/APN)
 // 并请求一次采样，使概览重读新生效 Profile 的信息，而不是沿用旧卡缓存值。
 void idf_modem_invalidate_sim_identity(void);

@@ -158,6 +158,7 @@
         MODEM_CHECK: c.modemReady ? '已就绪' : '未就绪', PUSH_COUNT: String(c.pushEnabledCount || 0), INBOX_MAX: String(c.inboxMax || ''),
         NTP: htmlEsc(c.ntpServer || ''), MDNS_HOST: htmlEsc(c.mdnsHost || 'sms'), RB_CHECKED: checked(c.rebootEnabled), RB_HOUR: String(c.rebootHour == null ? 3 : c.rebootHour),
         HB_CHECKED: checked(c.hbEnabled), HB_HOUR: String(c.hbHour == null ? 9 : c.hbHour), TZ_OPTIONS: buildTzOptions(c.tzOffsetMin),
+        SMS_HEALTH_CHECKED: checked(c.smsHealthEnabled), SMS_HEALTH_HOUR: String(c.smsHealthHour == null ? 10 : c.smsHealthHour), SMS_HEALTH_NOTIFY_CHECKED: checked(c.smsHealthNotify !== false),
         DATA_CHECKED: checked(c.dataEnabled), ROAMING_CHECKED: checked(c.roamingEnabled !== false),
         APN: htmlEsc(c.apn || ''), PHONE_NUMBER: htmlEsc(c.phoneNumber || ''),
         OPERATOR_PLMN: htmlEsc(c.operatorPlmn || ''), KA_PROFILE: htmlEsc(c.kaProfile || ''), PUSH_CHANNELS: buildPushChannels(c.pushChannels),

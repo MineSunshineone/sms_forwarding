@@ -1063,6 +1063,15 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
         return ESP_ERR_NO_MEM;
     }
 
+    // DHCP 主机名附带 STA MAC 后六位，多台设备在路由器客户端列表中可直接区分。
+    uint8_t sta_mac[6] = {};
+    if (esp_read_mac(sta_mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+        char hostname[16];
+        snprintf(hostname, sizeof(hostname), "sms-%02x%02x%02x", sta_mac[3], sta_mac[4], sta_mac[5]);
+        esp_err_t hostname_err = esp_netif_set_hostname(s_sta_netif, hostname);
+        if (hostname_err != ESP_OK) idf_logf("设置 DHCP 主机名失败: %s", esp_err_to_name(hostname_err));
+    }
+
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     bool wifi_inited = false;
     bool wifi_event_registered = false;
