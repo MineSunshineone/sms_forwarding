@@ -570,6 +570,10 @@ static esp_err_t invoke_es10c(const std::vector<uint8_t>& request,
                               Tlv& response,
                               std::string& message)
 {
+    struct OperationGuard {
+        OperationGuard() { idf_modem_begin_esim_operation(); }
+        ~OperationGuard() { idf_modem_end_esim_operation(); }
+    } guard;
     EsimApduSession session;
     esp_err_t err = session.open(message);
     if (err != ESP_OK) return err;
@@ -921,6 +925,7 @@ static esp_err_t profile_operation(const std::string& raw,
     esp_err_t err = resolve_identifier(raw, false, identifier, message);
     if (err != ESP_OK) return err;
 
+    if (refresh) idf_modem_expect_sim_refresh();
     int code = -1;
     err = profile_operation_once(identifier, enable, refresh, code, message);
     if (err != ESP_OK && refresh && code == 5) {

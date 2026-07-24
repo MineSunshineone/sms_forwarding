@@ -1028,6 +1028,12 @@ static void sms_task(void*)
         flush_pending_call_notify();
         expire_concat_slots();
 
+        // eSIM 逻辑通道期间只收 URC，不插入 CPMS、CMGL 或短信发送 AT。
+        if (idf_modem_esim_operation_active()) {
+            idf_modem_wait_event(500);
+            continue;
+        }
+
         IdfModemStatus modem = idf_modem_get_status();
         if (modem.atReady && !configured) {
             std::string ignored;

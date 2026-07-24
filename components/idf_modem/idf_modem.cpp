@@ -72,6 +72,8 @@ static bool s_identity_static_attempted = false;
 static bool s_identity_network_attempted = false;
 static std::atomic<int64_t> s_last_web_poll_us{-WEB_POLL_ACTIVE_WINDOW_US};
 static std::atomic<uint32_t> s_status_sample_requests{0};
+static std::atomic<uint32_t> s_esim_operation_depth{0};
+static std::atomic<int64_t> s_sim_refresh_guard_until_us{0};
 
 void idf_modem_signal_event(void);
 
@@ -475,17 +477,18 @@ static void capture_pending_uart_locked(uint32_t max_ms)
 static bool poll_unsolicited_uart(uint32_t max_ms)
 {
     if (!s_at_mutex) return false;
-    if (xSemaphoreTake(s_at_mutex, 0) != pdTRUE) return false;
+    if (xSemaphoreTakeRecursive(s_at_mutex, 0) != pdTRUE) return false;
     capture_pending_uart_locked(max_ms);
-    xSemaphoreGive(s_at_mutex);
+    xSemaphoreGiveRecursive(s_at_mutex);
     return true;
 }
 
 static bool at_channel_idle_now(void)
 {
+    if (idf_modem_esim_operation_active()) return false;
     if (!s_at_mutex) return false;
-    if (xSemaphoreTake(s_at_mutex, 0) != pdTRUE) return false;
-    xSemaphoreGive(s_at_mutex);
+    if (xSemaphoreTakeRecursive(s_at_mutex, 0) != pdTRUE) return false;
+    xSemaphoreGiveRecursive(s_at_mutex);
     return true;
 }
 
@@ -504,7 +507,7 @@ static void append_capped(std::string& out, const uint8_t* data, size_t len, siz
 esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response)
 {
     if (!s_started) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTake(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 500)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 500)) != pdTRUE) return ESP_ERR_TIMEOUT;
 
     capture_pending_uart_locked(30);
     std::string wire = cmd;
@@ -541,14 +544,14 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
         // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
         append_urc_text(response);
     }
-    xSemaphoreGive(s_at_mutex);
+    xSemaphoreGiveRecursive(s_at_mutex);
     return ret;
 }
 
 esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response)
 {
     if (!s_started || !token || !*token) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTake(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 500)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 500)) != pdTRUE) return ESP_ERR_TIMEOUT;
 
     capture_pending_uart_locked(30);
     std::string wire = cmd;
@@ -585,14 +588,14 @@ esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uin
         // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
         append_urc_text(response);
     }
-    xSemaphoreGive(s_at_mutex);
+    xSemaphoreGiveRecursive(s_at_mutex);
     return ret;
 }
 
 esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response)
 {
     if (!s_started || !pdu) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTake(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 2000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 2000)) != pdTRUE) return ESP_ERR_TIMEOUT;
 
     capture_pending_uart_locked(30);
     std::string wire = cmgs_cmd;
@@ -663,7 +666,7 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
         // RING/+CLIP 也要保留：否则整段响铃落在一次持锁 AT 交换内时来电通知丢失
         append_urc_text(response);
     }
-    xSemaphoreGive(s_at_mutex);
+    xSemaphoreGiveRecursive(s_at_mutex);
     return ret;
 }
 
@@ -1499,7 +1502,7 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularH
     normalize_keepalive_payload_size(host, path);
     append_no_cache_query(path);
 
-    if (xSemaphoreTake(s_at_mutex, pdMS_TO_TICKS(CELLULAR_HTTP_TIMEOUT_MS + 45000UL)) != pdTRUE) {
+    if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(CELLULAR_HTTP_TIMEOUT_MS + 45000UL)) != pdTRUE) {
         result.message = "模组串口忙，蜂窝HTTP未执行";
         return ESP_ERR_TIMEOUT;
     }
@@ -1530,7 +1533,7 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularH
             idf_log_line("关闭PDP上下文(CGACT=0)...");
             send_at_locked("AT+CGACT=0,1", 5000, resp);
         }
-        xSemaphoreGive(s_at_mutex);
+        xSemaphoreGiveRecursive(s_at_mutex);
         result.message = "蜂窝PDP未取得有效IP，请查看日志";
         return ESP_FAIL;
     }
@@ -1555,7 +1558,7 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularH
         result.message = ok ? "蜂窝HTTP payload 下载完成" : "蜂窝HTTP payload 下载失败，请查看日志";
     }
     result.ok = ok;
-    xSemaphoreGive(s_at_mutex);
+    xSemaphoreGiveRecursive(s_at_mutex);
     return ok ? ESP_OK : ESP_FAIL;
 }
 
@@ -1951,6 +1954,8 @@ static bool s_reinit_pending = false;
 
 static bool handle_reset_request_if_any(void)
 {
+    // 逻辑通道尚未关闭时重启会把 eSIM 操作截断；REFRESH 后上层主动请求的重启仍允许执行。
+    if (s_esim_operation_depth.load(std::memory_order_relaxed) != 0) return false;
     int request = s_reset_request.exchange(0, std::memory_order_relaxed);
     if (request == 0) return false;
 
@@ -2230,7 +2235,9 @@ static void modem_task(void*)
         // SIM 热插拔检测：低频轮询 AT+CPIN?，识别运行中插卡/拔卡。
         // 插入(无卡→有卡)：自动硬重启模组 + 作废旧身份，让新卡从干净状态初始化；
         // 拔出(有卡→无卡)：标记未就绪并清空身份，避免概览沿用旧卡信息。
-        if (esp_timer_get_time() >= sim_check_not_before_us &&
+        int64_t sim_check_now_us = esp_timer_get_time();
+        if (sim_check_now_us >= sim_check_not_before_us &&
+            sim_check_now_us >= s_sim_refresh_guard_until_us.load(std::memory_order_relaxed) &&
             (last_sim_check == 0 || now - last_sim_check > pdMS_TO_TICKS(SIM_CHECK_INTERVAL_MS)) &&
             at_channel_idle_now()) {
             last_sim_check = now;
@@ -2290,7 +2297,8 @@ esp_err_t idf_modem_start(const IdfConfig& config)
 {
     if (s_started) return ESP_OK;
     cleanup_start_resources();
-    s_at_mutex = xSemaphoreCreateMutex();
+    // eSIM 需跨多条 CCHO/CGLA/CCHC 独占 AT 通道，同任务内的单条 AT 再递归取锁。
+    s_at_mutex = xSemaphoreCreateRecursiveMutex();
     s_status_mutex = xSemaphoreCreateMutex();
     s_urc_mutex = xSemaphoreCreateMutex();
     if (!s_event_sem) s_event_sem = xSemaphoreCreateBinary();
@@ -2376,6 +2384,30 @@ void idf_modem_request_status_sample(void)
 {
     s_last_web_poll_us.store(esp_timer_get_time(), std::memory_order_relaxed);
     s_status_sample_requests.fetch_add(1, std::memory_order_relaxed);
+}
+
+void idf_modem_begin_esim_operation(void)
+{
+    s_esim_operation_depth.fetch_add(1, std::memory_order_relaxed);
+    if (s_at_mutex) xSemaphoreTakeRecursive(s_at_mutex, portMAX_DELAY);
+}
+
+void idf_modem_end_esim_operation(void)
+{
+    if (s_at_mutex) xSemaphoreGiveRecursive(s_at_mutex);
+    s_esim_operation_depth.fetch_sub(1, std::memory_order_relaxed);
+}
+
+bool idf_modem_esim_operation_active(void)
+{
+    return s_esim_operation_depth.load(std::memory_order_relaxed) != 0;
+}
+
+void idf_modem_expect_sim_refresh(void)
+{
+    // eSIM REFRESH 会让 CPIN 短暂掉线；若按物理拔插处理，恢复 READY 时会误触发硬重启。
+    s_sim_refresh_guard_until_us.store(esp_timer_get_time() + 90LL * 1000LL * 1000LL,
+                                       std::memory_order_relaxed);
 }
 
 static std::atomic<void (*)(void)> s_sim_identity_hook{nullptr};

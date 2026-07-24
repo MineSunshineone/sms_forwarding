@@ -2335,7 +2335,8 @@ static void esim_task(void* arg_raw)
 
     bool ok = (err == ESP_OK);
     // 启用/切换/禁用改变当前生效的卡：让模组重读号码/ICCID/运营商，避免概览沿用旧卡缓存
-    if (ok && (action == "enable" || action == "switch" || action == "disable")) {
+    bool sim_changed = ok && (action == "enable" || action == "switch" || action == "disable");
+    if (sim_changed) {
         idf_modem_invalidate_sim_identity();
     }
     bool cache_ready = false;
@@ -2343,11 +2344,21 @@ static void esim_task(void* arg_raw)
         std::string refresh_msg;
         std::vector<IdfEsimProfile> refreshed;
         std::string refreshed_eid;
-        esp_err_t refresh_err = idf_esim_list_profiles(refreshed, refreshed_eid, refresh_msg);
+        esp_err_t refresh_err = ESP_FAIL;
+        int attempts = sim_changed ? 3 : 1;
+        if (sim_changed) vTaskDelay(pdMS_TO_TICKS(3000));
+        for (int attempt = 0; attempt < attempts; ++attempt) {
+            refresh_err = idf_esim_list_profiles(refreshed, refreshed_eid, refresh_msg);
+            if (refresh_err == ESP_OK) break;
+            if (attempt + 1 < attempts) vTaskDelay(pdMS_TO_TICKS(2000));
+        }
         if (refresh_err == ESP_OK) {
             profiles = std::move(refreshed);
             eid = std::move(refreshed_eid);
             cache_ready = true;
+        } else if (sim_changed) {
+            idf_logf("eSIM 切卡已完成，Profile 列表暂不可读: %s", refresh_msg.c_str());
+            message += "；Profile 列表稍后刷新";
         } else {
             message += "；操作后刷新列表失败: " + refresh_msg;
         }

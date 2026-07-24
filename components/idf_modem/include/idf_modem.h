@@ -69,6 +69,12 @@ void idf_modem_reassert_sms_storage(void);
 // 每日后台短信体检：检查注册、PDU、CNMI 与短信存储，配置异常时自动重申。
 // 只能验证本机短信栈，无法证明运营商已实际投递一条新短信。
 bool idf_modem_sms_health_check(std::string& summary);
+// eSIM APDU 会话期间暂停模组/SMS 后台 AT，避免 CPMS/CMGL/健康探测插入逻辑通道操作。
+void idf_modem_begin_esim_operation(void);
+void idf_modem_end_esim_operation(void);
+bool idf_modem_esim_operation_active(void);
+// eSIM 启停会触发 SIM REFRESH，期间 CPIN 可能短暂非 READY；通知热插拔检测暂时忽略该瞬态。
+void idf_modem_expect_sim_refresh(void);
 // 启用/切换/禁用 eSIM Profile 后调用：清除缓存的卡相关身份(号码/ICCID/IMSI/运营商/APN)
 // 并请求一次采样，使概览重读新生效 Profile 的信息，而不是沿用旧卡缓存值。
 void idf_modem_invalidate_sim_identity(void);
