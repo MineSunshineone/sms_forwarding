@@ -1,6 +1,7 @@
 #include "idf_config.h"
 
 #include <algorithm>
+#include <cstring>
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -1733,14 +1734,14 @@ esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std
     nvs_handle_t nvs = 0;
     esp_err_t err = begin_field_save(&nvs);
     if (err != ESP_OK) return err;
-    IdfConfig current = config_snapshot();
+    IdfSimSettingsView current = idf_config_get_sim_settings_view();
     for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
         if (next_credentials[i].iccid.empty()) continue;
         bool reset_pin = next_credentials[i].pinFailedAttempts == UINT8_MAX;
         bool reset_puk = next_credentials[i].pukFailedAttempts == UINT8_MAX;
         next_credentials[i].pinFailedAttempts = 0;
         next_credentials[i].pukFailedAttempts = 0;
-        for (const auto& old : current.simCredentials) {
+        for (const auto& old : current.credentials) {
             if (old.iccid != next_credentials[i].iccid) continue;
             if (next_credentials[i].pin.empty()) next_credentials[i].pin = old.pin;
             else if (next_credentials[i].pin != old.pin) next_credentials[i].pinFailedAttempts = 0;

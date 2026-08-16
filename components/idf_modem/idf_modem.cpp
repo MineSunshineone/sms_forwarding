@@ -373,6 +373,14 @@ static bool startup_info_complete(void)
     return complete;
 }
 
+// ICCID/运营商等字段可能被 SIM 或网络长期拒绝返回；完成一轮采样后即可进入 ready，
+// 缺失字段仍由 startup_info_complete() 驱动后台补采，不能让概览永远停在“读取中”。
+static bool startup_sampling_done(void)
+{
+    IdfModemStatus status = idf_modem_get_status();
+    return status.signalFresh && status.identityFresh;
+}
+
 static void reset_identity_sampling_state(void)
 {
     s_identity_static_attempted = false;
@@ -722,7 +730,9 @@ static std::string parse_iccid_response(const std::string& raw)
     value.erase(std::remove(value.begin(), value.end(), '"'), value.end());
     for (char& ch : value) if (ch == 'f') ch = 'F';
     if (!value.empty() && value.back() == 'F') value.pop_back();
-    return is_iccid_text(value) ? value : std::string();
+    if (is_iccid_text(value)) return value;
+    // 部分固件会在 ICCID 前后附加槽位或状态字段，退回提取响应中的连续数字。
+    return first_digit_run(raw, 15, 22);
 }
 
 static std::string query_current_iccid(void)
@@ -2243,7 +2253,7 @@ static void modem_task(void*)
         sample_signal_once();
         sample_signal_detail_once();
         sample_identity_once(false, true);
-        post_register_done = startup_info_complete();
+        post_register_done = startup_sampling_done();
         set_phase(post_register_done ? "ready" : "sampling");
     }
 
@@ -2325,7 +2335,7 @@ static void modem_task(void*)
                 sample_identity_once(false, true);
                 last_identity = now;
             }
-            if (startup_sampling && startup_info_complete()) {
+            if (startup_sampling && startup_sampling_done()) {
                 set_phase("ready");
                 post_register_done = true;
             }
@@ -2370,7 +2380,7 @@ static void modem_task(void*)
                         sample_signal_once();
                         sample_signal_detail_once();
                         sample_identity_once(false, true);
-                        post_register_done = startup_info_complete();
+                        post_register_done = startup_sampling_done();
                         set_phase(post_register_done ? "ready" : "sampling");
                     }
                 } else {
