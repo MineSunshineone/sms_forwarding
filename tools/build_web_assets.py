@@ -10,6 +10,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 BRANCH = "codex/stage-issues-18-30"
+BASE = "f507d5b45e5c7a11ef588fdb119bd6ba406fcfe9"
 
 
 def replace_once(rel: str, old: str, new: str) -> None:
@@ -120,8 +121,9 @@ def main() -> int:
 
     apply_changes()
 
-    # 恢复仓库原始生成器；最终提交不保留本引导器。
-    run("git", "checkout", "HEAD^", "--", "tools/build_web_assets.py")
+    # actions/checkout 默认浅克隆，显式取回 master 基线后恢复原生成器。
+    run("git", "fetch", "origin", BASE, "--depth=1")
+    run("git", "checkout", "FETCH_HEAD", "--", "tools/build_web_assets.py")
     run(sys.executable, "tools/build_web_assets.py")
     run(sys.executable, "tools/build_web_assets.py", "--check")
     run("git", "diff", "--check")
