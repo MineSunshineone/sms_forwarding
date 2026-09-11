@@ -1984,9 +1984,7 @@
         box.appendChild(d);
       });
     }
-    // ---- 规则本地测试：镜像固件 eval_forward_rules + 派发门控（自上而下首条命中即止）----
-    // 浏览器用 JS 正则预览，与设备端 POSIX ERE 在个别语法上可能有差异
-    // 按固件派发逻辑折算实际会发出的目标：推送总开关、通道启用、邮件启用+配置齐全
+    // ---- 规则测试：匹配交给固件真实规则引擎，前端只折算当前可投递目标 ----
     function deliverTargets(useEmail, chanMask) {
       var c = webConfig || {}, arr = c.pushChannels || [];
       var out = [], skipped = [];
@@ -2009,34 +2007,34 @@
       var text = document.getElementById('rtText').value || '';
       var r = document.getElementById('rtResult');
       if (!text && !from) { r.className = 'result-box result-error'; r.textContent = '请先填写测试发件人或正文'; return; }
-      for (var i = 0; i < fwdRules.length; i++) {
-        var rule = fwdRules[i];
-        if (!rule.enabled || !rule.pattern) continue;
-        var hit = false;
-        if (rule.type === 'kw') {
-          hit = text.indexOf(rule.pattern) >= 0;
-        } else {
-          try { hit = new RegExp(rule.pattern, 'i').test(rule.type === 'from' ? from : text); }
-          catch (e) { r.className = 'result-box result-error'; r.textContent = '规则 ' + (i + 1) + ' 的正则浏览器无法解析，请检查语法：' + e.message; return; }
-        }
-        if (!hit) continue;
-        if (rule.drop) {
+      r.className = 'result-box result-loading'; r.textContent = '按设备实际规则测试中...';
+      var raw = (document.getElementById('forwardRulesRaw') || {}).value || '';
+      var body = new URLSearchParams();
+      body.append('rules', raw); body.append('sender', from); body.append('text', text);
+      csrfFetch('/testrule', {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body})
+        .then(jsonOrThrow).then(function(result) {
+        var index = result.ruleIndex || 0;
+        if (result.matched && result.drop) {
           r.className = 'result-box result-error';
-          r.textContent = '命中规则 ' + (i + 1) + ' → 丢弃(不转发)';
+          r.textContent = '命中规则 ' + index + ' → 丢弃(不转发)';
           return;
         }
-        var d = deliverTargets(rule.email, rule.chans);
-        var msg = '命中规则 ' + (i + 1) + ' → ' + (d.out.length ? '实际转发到：' + d.out.join('、') : '没有可用转发目标(该短信不会被转发)');
+        var selected = {};
+        if (result.matched) {
+          for (var c = 1; c <= 5; c++) selected[c] = !!(result.chMask & (1 << (c - 1)));
+        } else {
+          for (var n = 1; n <= 5; n++) selected[n] = true;
+        }
+        var d = deliverTargets(result.matched ? !!result.email : true, selected);
+        var prefix = result.matched ? ('命中规则 ' + index + ' → ') : '未命中任何规则 → ';
+        var msg = prefix + (d.out.length ? (result.matched ? '实际转发到：' : '按默认策略实际转发到：') + d.out.join('、') : '没有可用转发目标(该短信不会被转发)');
         if (d.skipped.length) msg += '；跳过：' + d.skipped.join('、');
-        r.className = 'result-box ' + (d.out.length ? 'result-success' : 'result-error');
+        r.className = 'result-box ' + (d.out.length ? (result.matched ? 'result-success' : 'result-info') : 'result-error');
         r.textContent = msg;
-        return;
-      }
-      // 未命中：固件默认转发到全部启用通道 + 邮件(各自仍受开关/配置门控)
-      var all = {}; for (var n = 1; n <= 5; n++) all[n] = true;
-      var dd = deliverTargets(true, all);
-      r.className = 'result-box ' + (dd.out.length ? 'result-info' : 'result-error');
-      r.textContent = '未命中任何规则 → ' + (dd.out.length ? '按默认策略实际转发到：' + dd.out.join('、') : '没有可用转发目标(该短信不会被转发)');
+      }).catch(function(e) {
+        r.className = 'result-box result-error';
+        r.textContent = '规则测试失败：' + (e && e.message ? e.message : '设备未返回有效结果');
+      });
     }
 
     // ---- 短信详情抽屉(点击展开) ----

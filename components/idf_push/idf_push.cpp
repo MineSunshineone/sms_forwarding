@@ -131,13 +131,6 @@ struct TestJob {
     std::string message;
 };
 
-struct ForwardDecision {
-    bool matched = false;
-    bool drop = false;
-    uint32_t chMask = 0;
-    bool email = false;
-};
-
 static SemaphoreHandle_t s_mutex = nullptr;
 // worker 唤醒信号：新任务入队即刻开始处理，不等 100ms 空闲轮询
 static SemaphoreHandle_t s_wake_sem = nullptr;
@@ -606,10 +599,13 @@ static bool regex_search_case_insensitive(const std::string& pattern, const std:
     return hit;
 }
 
-static ForwardDecision eval_forward_rules(const std::string& rules, const std::string& sender, const std::string& body)
+IdfForwardRuleDecision idf_push_eval_forward_rules(const std::string& rules,
+                                                   const std::string& sender,
+                                                   const std::string& body)
 {
-    ForwardDecision d;
+    IdfForwardRuleDecision d;
     size_t pos = 0;
+    int rule_index = 0;
     while (pos < rules.size()) {
         size_t end = rules.find('\n', pos);
         if (end == std::string::npos) end = rules.size();
@@ -620,6 +616,7 @@ static ForwardDecision eval_forward_rules(const std::string& rules, const std::s
         size_t t1 = line.find('\t');
         size_t t2 = t1 == std::string::npos ? std::string::npos : line.find('\t', t1 + 1);
         if (t1 == std::string::npos || t2 == std::string::npos) continue;
+        ++rule_index;
         size_t t3 = line.find('\t', t2 + 1);
         std::string type = line.substr(0, t1);
         std::string pat = line.substr(t1 + 1, t2 - t1 - 1);
@@ -634,6 +631,7 @@ static ForwardDecision eval_forward_rules(const std::string& rules, const std::s
         if (!hit) continue;
 
         d.matched = true;
+        d.ruleIndex = rule_index;
         size_t ap = 0;
         while (ap <= action.size()) {
             size_t comma = action.find(',', ap);
@@ -1530,9 +1528,10 @@ static bool process_forward_one()
     }
 
     const IdfPushForwardView cfg = idf_config_get_push_forward_view();
-    ForwardDecision fd = eval_forward_rules(cfg.forwardRules, job.sender, job.text);
+    IdfForwardRuleDecision fd = idf_push_eval_forward_rules(cfg.forwardRules, job.sender, job.text);
     if (fd.matched && fd.drop) {
-        idf_logf("转发规则命中：丢弃短信 id=%u", static_cast<unsigned>(job.inboxId));
+        idf_logf("转发规则 %d 命中：丢弃短信 id=%u", fd.ruleIndex,
+                 static_cast<unsigned>(job.inboxId));
         idf_inbox_mark_forwarded(job.inboxId);
         s_busy.store(false, std::memory_order_relaxed);
         return true;

@@ -2172,6 +2172,44 @@ static esp_err_t handle_test_push(httpd_req_t* req)
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
+static esp_err_t handle_test_rule(httpd_req_t* req)
+{
+    if (!check_auth(req)) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
+
+    std::string raw;
+    if (read_body(req, raw, 16384) != ESP_OK) return ESP_OK;
+    IdfFormFields fields = parse_urlencoded(raw);
+    std::string rules = field_text(fields, "rules");
+    std::string sender = field_text(fields, "sender");
+    std::string text = field_text(fields, "text");
+    set_json_no_cache(req);
+
+    if (rules.size() > 2048 || sender.size() > 128 || text.size() > 4096) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"规则或测试内容过长\"}");
+    }
+
+    std::string validation_error;
+    if (idf_config_validate_forward_rules(rules, &validation_error) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        std::string body = "{\"success\":false,";
+        json_prop(body, "message", validation_error.empty() ? "转发规则格式无效" : validation_error);
+        body += "}";
+        return httpd_resp_send(req, body.data(), body.size());
+    }
+
+    IdfForwardRuleDecision decision = idf_push_eval_forward_rules(rules, sender, text);
+    char body[192];
+    snprintf(body, sizeof(body),
+             "{\"success\":true,\"matched\":%s,\"drop\":%s,\"email\":%s,\"chMask\":%u,\"ruleIndex\":%d}",
+             decision.matched ? "true" : "false",
+             decision.drop ? "true" : "false",
+             decision.email ? "true" : "false",
+             static_cast<unsigned>(decision.chMask), decision.ruleIndex);
+    return httpd_resp_sendstr(req, body);
+}
+
 static bool keepalive_url_valid(const std::string& raw_url, std::string& err)
 {
     std::string url = idf_util_trim_copy(raw_url);
@@ -3932,6 +3970,7 @@ esp_err_t idf_web_start(void)
     IDF_WEB_TRY_REGISTER("/at", register_handler(s_server, "/at", HTTP_ANY, handle_at));
     IDF_WEB_TRY_REGISTER("/ping", register_handler(s_server, "/ping", HTTP_ANY, handle_ping));
     IDF_WEB_TRY_REGISTER("/testpush", register_handler(s_server, "/testpush", HTTP_ANY, handle_test_push));
+    IDF_WEB_TRY_REGISTER("/testrule", register_handler(s_server, "/testrule", HTTP_POST, handle_test_rule));
     IDF_WEB_TRY_REGISTER("/ussd", register_handler(s_server, "/ussd", HTTP_ANY, handle_ussd));
     IDF_WEB_TRY_REGISTER("/flight", register_handler(s_server, "/flight", HTTP_ANY, handle_flight));
     IDF_WEB_TRY_REGISTER("/modem", register_handler(s_server, "/modem", HTTP_ANY, handle_modem_control));
