@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""仅供 staging CI：安全地运行一次性补丁引导器。"""
+"""仅供 staging CI：安全地运行一次性补丁引导器；最终提交前会恢复原生成器。"""
 
 from __future__ import annotations
 
