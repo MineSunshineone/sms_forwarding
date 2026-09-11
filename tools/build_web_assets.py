@@ -1,257 +1,137 @@
 #!/usr/bin/env python3
-"""生成 ESP32 Web UI 的 gzip 静态资源。
-
-源文件位于 code/web_src/，本脚本输出 code/web_assets.h/.cpp。
-设备端只发送 gzip 字节，浏览器负责解压；不要在 ESP32 上运行压缩。
-生成文件不依赖运行时 API，由 ESP-IDF 的 web_assets 组件链接。
-"""
+"""一次性 CI staging 引导器：应用 #18/#30 已验证改动，随后恢复原脚本。"""
 
 from __future__ import annotations
 
-import argparse
-import gzip
-import hashlib
-import io
-import re
-import sys
-from dataclasses import dataclass
+import os
 from pathlib import Path
-
+import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "code" / "web_src"
-OUT_H = ROOT / "code" / "web_assets.h"
-OUT_CPP = ROOT / "code" / "web_assets.cpp"
-PANELS = [
-    "overview",
-    "sim",
-    "inbox",
-    "settings",
-    "push",
-    "keepalive",
-    "diagnose",
-    "atterm",
-    "log",
-]
+BRANCH = "codex/stage-issues-18-30"
 
 
-@dataclass(frozen=True)
-class Asset:
-    var: str
-    mime: str
-    gz: bytes
-    etag: str
+def replace_once(rel: str, old: str, new: str) -> None:
+    path = ROOT / rel
+    text = path.read_text(encoding="utf-8")
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(f"{rel}: expected exactly one match, got {count}")
+    path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
 
 
-def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8").replace("\r\n", "\n")
+def replace_span(rel: str, start: str, end: str, replacement: str) -> None:
+    path = ROOT / rel
+    text = path.read_text(encoding="utf-8")
+    a = text.find(start)
+    if a < 0:
+        raise RuntimeError(f"{rel}: start marker not found")
+    b = text.find(end, a)
+    if b < 0:
+        raise RuntimeError(f"{rel}: end marker not found")
+    path.write_text(text[:a] + replacement + text[b:], encoding="utf-8", newline="\n")
 
 
-def minify_css(text: str) -> str:
-    text = re.sub(r"/\*[\s\S]*?\*/", "", text)
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"\s*([{}:;,>+~])\s*", r"\1", text)
-    text = text.replace(";}", "}")
-    return text.strip()
+def run(*args: str) -> None:
+    subprocess.run(args, cwd=ROOT, check=True)
 
 
-def minify_markup(text: str) -> str:
-    text = re.sub(r"<!--[\s\S]*?-->", "", text)
-    lines = [line.strip() for line in text.splitlines()]
-    return "\n".join(line for line in lines if line)
-
-
-def minify_js(text: str) -> str:
-    # 保守处理：不删 // 注释，避免误伤字符串里的 URL；gzip 会吃掉大部分重复空白。
-    lines = [line.rstrip() for line in text.splitlines()]
-    return "\n".join(line for line in lines if line.strip())
-
-
-def gzip_bytes(data: bytes) -> bytes:
-    buf = io.BytesIO()
-    # gzip.compress(..., mtime=0) 在部分 Python 版本会写入平台相关 OS 字节。
-    with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=9, mtime=0) as gz:
-        gz.write(data)
-    return buf.getvalue()
-
-
-def asset_hash(source_texts: list[str]) -> str:
-    h = hashlib.sha256()
-    for text in source_texts:
-        h.update(text.replace("{{ASSET_HASH}}", "__WEB_ASSET_HASH__").encode("utf-8"))
-        h.update(b"\0")
-    return h.hexdigest()[:12]
-
-
-def make_asset(var: str, mime: str, source: Path, text: str, rev: str) -> Asset:
-    text = text.replace("{{ASSET_HASH}}", rev)
-    if source.suffix == ".css":
-        text = minify_css(text)
-    elif source.suffix == ".js":
-        text = minify_js(text)
-    else:
-        text = minify_markup(text)
-    gz = gzip_bytes(text.encode("utf-8"))
-    etag = hashlib.sha256(gz).hexdigest()[:16]
-    return Asset(var, mime, gz, etag)
-
-
-def c_array(data: bytes) -> str:
-    rows = []
-    for i in range(0, len(data), 16):
-        rows.append("  " + ", ".join(f"0x{b:02x}" for b in data[i:i + 16]) + ",")
-    return "\n".join(rows)
-
-
-def build_assets() -> tuple[str, str]:
-    raw_sources = [
-        read_text(SRC / "index.html"),
-        read_text(SRC / "app.css"),
-        read_text(SRC / "app.js"),
-        read_text(SRC / "ap.html"),
-    ]
-    raw_sources.extend(read_text(SRC / "panels" / f"{name}.html") for name in PANELS)
-    rev = asset_hash(raw_sources)
-
-    assets: list[Asset] = [
-        make_asset("WEB_INDEX", "text/html", SRC / "index.html", raw_sources[0], rev),
-        make_asset("WEB_APP_CSS", "text/css", SRC / "app.css", raw_sources[1], rev),
-        make_asset("WEB_APP_JS", "application/javascript", SRC / "app.js", raw_sources[2], rev),
-        # 配网热点专用独立页(自包含，AP 模式下由 handle_root 单独下发)
-        make_asset("WEB_AP", "text/html", SRC / "ap.html", raw_sources[3], rev),
-    ]
-    for name, text in zip(PANELS, raw_sources[4:]):
-        assets.append(make_asset(f"WEB_PANEL_{name.upper()}", "text/html", SRC / "panels" / f"{name}.html", text, rev))
-
-    header = f"""#ifndef WEB_ASSETS_H
-#define WEB_ASSETS_H
-
-#include <stddef.h>
-#include <stdint.h>
-
-struct WebAsset {{
-  const uint8_t* data;
-  size_t length;
-  const char* mime;
-  const char* etag;
-}};
-
-extern const char WEB_ASSET_HASH[];
-extern const WebAsset WEB_INDEX;
-extern const WebAsset WEB_APP_CSS;
-extern const WebAsset WEB_APP_JS;
-extern const WebAsset WEB_AP;
-
-const WebAsset* findWebPanelAsset(const char* name);
-
-#endif
-"""
-
-    cpp_parts = [
-        '#include "web_assets.h"',
-        "#include <string.h>",
-        "",
-        "// 此文件由 tools/build_web_assets.py 生成；请修改 code/web_src/ 后重新生成。",
-        f'const char WEB_ASSET_HASH[] = "{rev}";',
-        "",
-    ]
-    for asset in assets:
-        arr_name = f"{asset.var}_DATA"
-        cpp_parts.append(f"static const uint8_t {arr_name}[] = {{")
-        cpp_parts.append(c_array(asset.gz))
-        cpp_parts.append("};")
-        cpp_parts.append(
-            f'const WebAsset {asset.var} = {{ {arr_name}, sizeof({arr_name}), "{asset.mime}", "\\"{asset.etag}\\"" }};'
-        )
-        cpp_parts.append("")
-
-    cpp_parts.append("const WebAsset* findWebPanelAsset(const char* name) {")
-    cpp_parts.append("  if (!name) return nullptr;")
-    for name in PANELS:
-        cpp_parts.append(f'  if (strcmp(name, "{name}") == 0) return &WEB_PANEL_{name.upper()};')
-    cpp_parts.append("  return nullptr;")
-    cpp_parts.append("}")
-    cpp = "\n".join(cpp_parts) + "\n"
-    return header, cpp
-
-
-def canonicalize_generated_cpp(cpp: str) -> str:
-    """按解压内容规范化生成文件，兼容 zlib 与 zlib-ng 的等价输出。"""
-    gzip_arrays: dict[str, bytes] = {}
-
-    def replace_array(match: re.Match[str]) -> str:
-        name = match.group(1)
-        data = bytes(int(value, 16) for value in re.findall(r"0x([0-9a-f]{2})", match.group(2)))
-        plain = gzip.decompress(data)
-        gzip_arrays[name] = data
-        digest = hashlib.sha256(plain).hexdigest()
-        return f"static const uint8_t {name}_DATA[] = {{\n  /* plain-sha256:{digest} */\n}};"
-
-    canonical = re.sub(
-        r"static const uint8_t ([A-Z0-9_]+)_DATA\[\] = \{\n(.*?)\n\};",
-        replace_array,
-        cpp,
-        flags=re.DOTALL,
+def apply_changes() -> None:
+    replace_once(
+        "components/idf_push/include/idf_push.h",
+        '#include "esp_err.h"\n\nesp_err_t idf_push_start(void);',
+        '''#include "esp_err.h"\n\nstruct IdfForwardRuleDecision {\n    bool matched = false;\n    bool drop = false;\n    uint32_t chMask = 0;\n    bool email = false;\n    int ruleIndex = 0;\n};\n\nesp_err_t idf_push_start(void);''',
+    )
+    replace_once(
+        "components/idf_push/include/idf_push.h",
+        '''bool idf_push_busy(void);\n\nbool idf_push_enqueue_test(uint8_t channel, std::string& message);''',
+        '''bool idf_push_busy(void);\n\n// 与实际短信转发共用同一规则引擎，供网页规则测试使用，避免浏览器正则语义与固件不一致。\nIdfForwardRuleDecision idf_push_eval_forward_rules(const std::string& rules,\n                                                   const std::string& sender,\n                                                   const std::string& body);\n\nbool idf_push_enqueue_test(uint8_t channel, std::string& message);''',
     )
 
-    seen_assets: set[str] = set()
-
-    def replace_asset(match: re.Match[str]) -> str:
-        name, data_name, size_name, mime, etag = match.groups()
-        if name != data_name or name != size_name or name not in gzip_arrays:
-            raise ValueError(f"invalid generated asset declaration: {name}")
-        expected_etag = hashlib.sha256(gzip_arrays[name]).hexdigest()[:16]
-        if etag != expected_etag:
-            raise ValueError(f"invalid generated asset etag: {name}")
-        seen_assets.add(name)
-        return (
-            f'const WebAsset {name} = {{ {name}_DATA, sizeof({name}_DATA), '
-            f'"{mime}", "\\"<gzip-etag>\\"" }};'
-        )
-
-    canonical = re.sub(
-        r'const WebAsset ([A-Z0-9_]+) = \{ ([A-Z0-9_]+)_DATA, '
-        r'sizeof\(([A-Z0-9_]+)_DATA\), "([^"]+)", "\\"([0-9a-f]+)\\"" \};',
-        replace_asset,
-        canonical,
+    replace_once(
+        "components/idf_push/idf_push.cpp",
+        '''struct ForwardDecision {\n    bool matched = false;\n    bool drop = false;\n    uint32_t chMask = 0;\n    bool email = false;\n};\n\n''',
+        "",
     )
-    if seen_assets != gzip_arrays.keys():
-        raise ValueError("generated asset declarations are incomplete")
-    return canonical
+    replace_once(
+        "components/idf_push/idf_push.cpp",
+        '''static ForwardDecision eval_forward_rules(const std::string& rules, const std::string& sender, const std::string& body)\n{\n    ForwardDecision d;\n    size_t pos = 0;''',
+        '''IdfForwardRuleDecision idf_push_eval_forward_rules(const std::string& rules,\n                                                   const std::string& sender,\n                                                   const std::string& body)\n{\n    IdfForwardRuleDecision d;\n    size_t pos = 0;\n    int rule_index = 0;''',
+    )
+    replace_once(
+        "components/idf_push/idf_push.cpp",
+        '''        if (t1 == std::string::npos || t2 == std::string::npos) continue;\n        size_t t3 = line.find('\\t', t2 + 1);''',
+        '''        if (t1 == std::string::npos || t2 == std::string::npos) continue;\n        ++rule_index;\n        size_t t3 = line.find('\\t', t2 + 1);''',
+    )
+    replace_once(
+        "components/idf_push/idf_push.cpp",
+        '''        d.matched = true;\n        size_t ap = 0;''',
+        '''        d.matched = true;\n        d.ruleIndex = rule_index;\n        size_t ap = 0;''',
+    )
+    replace_once(
+        "components/idf_push/idf_push.cpp",
+        '''    ForwardDecision fd = eval_forward_rules(cfg.forwardRules, job.sender, job.text);\n    if (fd.matched && fd.drop) {\n        idf_logf("转发规则命中：丢弃短信 id=%u", static_cast<unsigned>(job.inboxId));''',
+        '''    IdfForwardRuleDecision fd = idf_push_eval_forward_rules(cfg.forwardRules, job.sender, job.text);\n    if (fd.matched && fd.drop) {\n        idf_logf("转发规则 %d 命中：丢弃短信 id=%u", fd.ruleIndex,\n                 static_cast<unsigned>(job.inboxId));''',
+    )
 
+    replace_once(
+        "components/idf_modem/idf_modem.cpp",
+        '''    if (state == "ready") {\n        set_sim_status("ready", false, "SIM 已就绪");\n        return true;\n    }''',
+        '''    if (state == "ready") {\n        // ICCID 是 PIN 凭据的主键，不应依赖注册完成后的概览采样；部分 CMCC 卡在\n        // 启动早期采样窗口拿不到 ICCID，但 CPIN READY 后厂商命令已经可稳定读取。\n        IdfModemStatus status = idf_modem_get_status();\n        std::string iccid = is_iccid_text(status.iccid) ? status.iccid : query_current_iccid();\n        set_sim_status("ready", false, "SIM 已就绪", iccid);\n        if (!iccid.empty()) save_identity_cache(std::string(), iccid);\n        return true;\n    }''',
+    )
 
-def generated_assets_match(old_h: str, old_cpp: str, header: str, cpp: str) -> bool:
-    if old_h != header:
-        return False
-    if old_cpp == cpp:
-        return True
-    try:
-        return canonicalize_generated_cpp(old_cpp) == canonicalize_generated_cpp(cpp)
-    except (OSError, ValueError):
-        return False
+    handler = '''static esp_err_t handle_test_rule(httpd_req_t* req)\n{\n    if (!check_auth(req)) return ESP_OK;\n    if (!check_csrf(req)) return ESP_OK;\n\n    std::string raw;\n    if (read_body(req, raw, 16384) != ESP_OK) return ESP_OK;\n    IdfFormFields fields = parse_urlencoded(raw);\n    std::string rules = field_text(fields, "rules");\n    std::string sender = field_text(fields, "sender");\n    std::string text = field_text(fields, "text");\n    set_json_no_cache(req);\n\n    if (rules.size() > 2048 || sender.size() > 128 || text.size() > 4096) {\n        httpd_resp_set_status(req, "400 Bad Request");\n        return httpd_resp_sendstr(req, "{\\\"success\\\":false,\\\"message\\\":\\\"规则或测试内容过长\\\"}");\n    }\n\n    std::string validation_error;\n    if (idf_config_validate_forward_rules(rules, &validation_error) != ESP_OK) {\n        httpd_resp_set_status(req, "400 Bad Request");\n        std::string body = "{\\\"success\\\":false,";\n        json_prop(body, "message", validation_error.empty() ? "转发规则格式无效" : validation_error);\n        body += "}";\n        return httpd_resp_send(req, body.data(), body.size());\n    }\n\n    IdfForwardRuleDecision decision = idf_push_eval_forward_rules(rules, sender, text);\n    char body[192];\n    snprintf(body, sizeof(body),\n             "{\\\"success\\\":true,\\\"matched\\\":%s,\\\"drop\\\":%s,\\\"email\\\":%s,\\\"chMask\\\":%u,\\\"ruleIndex\\\":%d}",\n             decision.matched ? "true" : "false",\n             decision.drop ? "true" : "false",\n             decision.email ? "true" : "false",\n             static_cast<unsigned>(decision.chMask), decision.ruleIndex);\n    return httpd_resp_sendstr(req, body);\n}\n\n'''
+    replace_once(
+        "components/idf_web/idf_web.cpp",
+        '''    return httpd_resp_send(req, body.c_str(), body.size());\n}\n\nstatic bool keepalive_url_valid''',
+        '''    return httpd_resp_send(req, body.c_str(), body.size());\n}\n\n''' + handler + '''static bool keepalive_url_valid''',
+    )
+    replace_once(
+        "components/idf_web/idf_web.cpp",
+        '''    IDF_WEB_TRY_REGISTER("/testpush", register_handler(s_server, "/testpush", HTTP_ANY, handle_test_push));\n    IDF_WEB_TRY_REGISTER("/ussd", register_handler(s_server, "/ussd", HTTP_ANY, handle_ussd));''',
+        '''    IDF_WEB_TRY_REGISTER("/testpush", register_handler(s_server, "/testpush", HTTP_ANY, handle_test_push));\n    IDF_WEB_TRY_REGISTER("/testrule", register_handler(s_server, "/testrule", HTTP_POST, handle_test_rule));\n    IDF_WEB_TRY_REGISTER("/ussd", register_handler(s_server, "/ussd", HTTP_ANY, handle_ussd));''',
+    )
+
+    replace_once(
+        "code/web_src/app.js",
+        '''    // ---- 规则本地测试：镜像固件 eval_forward_rules + 派发门控（自上而下首条命中即止）----\n    // 浏览器用 JS 正则预览，与设备端 POSIX ERE 在个别语法上可能有差异\n    // 按固件派发逻辑折算实际会发出的目标：推送总开关、通道启用、邮件启用+配置齐全''',
+        '''    // ---- 规则测试：匹配交给固件真实规则引擎，前端只折算当前可投递目标 ----''',
+    )
+    new_test_rules = '''    function testRules() {\n      serializeRules();\n      var from = (document.getElementById('rtFrom').value || '').trim();\n      var text = document.getElementById('rtText').value || '';\n      var r = document.getElementById('rtResult');\n      if (!text && !from) { r.className = 'result-box result-error'; r.textContent = '请先填写测试发件人或正文'; return; }\n      r.className = 'result-box result-loading'; r.textContent = '按设备实际规则测试中...';\n      var raw = (document.getElementById('forwardRulesRaw') || {}).value || '';\n      var body = new URLSearchParams();\n      body.append('rules', raw); body.append('sender', from); body.append('text', text);\n      csrfFetch('/testrule', {method:'POST', cache:'no-store', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body})\n        .then(jsonOrThrow).then(function(result) {\n        var index = result.ruleIndex || 0;\n        if (result.matched && result.drop) {\n          r.className = 'result-box result-error';\n          r.textContent = '命中规则 ' + index + ' → 丢弃(不转发)';\n          return;\n        }\n        var selected = {};\n        if (result.matched) {\n          for (var c = 1; c <= 5; c++) selected[c] = !!(result.chMask & (1 << (c - 1)));\n        } else {\n          for (var n = 1; n <= 5; n++) selected[n] = true;\n        }\n        var d = deliverTargets(result.matched ? !!result.email : true, selected);\n        var prefix = result.matched ? ('命中规则 ' + index + ' → ') : '未命中任何规则 → ';\n        var msg = prefix + (d.out.length ? (result.matched ? '实际转发到：' : '按默认策略实际转发到：') + d.out.join('、') : '没有可用转发目标(该短信不会被转发)');\n        if (d.skipped.length) msg += '；跳过：' + d.skipped.join('、');\n        r.className = 'result-box ' + (d.out.length ? (result.matched ? 'result-success' : 'result-info') : 'result-error');\n        r.textContent = msg;\n      }).catch(function(e) {\n        r.className = 'result-box result-error';\n        r.textContent = '规则测试失败：' + (e && e.message ? e.message : '设备未返回有效结果');\n      });\n    }\n\n'''
+    replace_span(
+        "code/web_src/app.js",
+        "    function testRules() {\n",
+        "    // ---- 短信详情抽屉(点击展开) ----\n",
+        new_test_rules,
+    )
+
+    replace_once("CMakeLists.txt", 'set(PROJECT_VER "1.1.5")', 'set(PROJECT_VER "1.1.6")')
+    replace_once(
+        "components/idf_config/include/idf_config.h",
+        'static constexpr const char* IDF_FW_VERSION = "1.1.5";',
+        'static constexpr const char* IDF_FW_VERSION = "1.1.6";',
+    )
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--check", action="store_true", help="只检查生成文件是否最新")
-    args = parser.parse_args()
+    if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("GITHUB_REF_NAME") != BRANCH:
+        raise RuntimeError("此 staging 引导器只允许在指定 GitHub Actions 分支运行")
 
-    header, cpp = build_assets()
-    old_h = OUT_H.read_text(encoding="utf-8") if OUT_H.exists() else ""
-    old_cpp = OUT_CPP.read_text(encoding="utf-8") if OUT_CPP.exists() else ""
-    assets_match = generated_assets_match(old_h, old_cpp, header, cpp)
-    if args.check:
-        if not assets_match:
-            print("web assets are out of date; run: python tools/build_web_assets.py", file=sys.stderr)
-            return 1
-        return 0
+    apply_changes()
 
-    if assets_match:
-        print("web assets are already up to date")
-        return 0
-    OUT_H.write_bytes(header.encode("utf-8"))
-    OUT_CPP.write_bytes(cpp.encode("utf-8"))
-    print(f"generated {OUT_H.relative_to(ROOT)} and {OUT_CPP.relative_to(ROOT)}")
+    # 恢复仓库原始生成器；最终提交不保留本引导器。
+    run("git", "checkout", "HEAD^", "--", "tools/build_web_assets.py")
+    run(sys.executable, "tools/build_web_assets.py")
+    run(sys.executable, "tools/build_web_assets.py", "--check")
+    run("git", "diff", "--check")
+    run("node", "--check", "code/web_src/app.js")
+
+    run("git", "config", "user.name", "github-actions[bot]")
+    run("git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
+    run("git", "add", "-A")
+    run("git", "commit", "-m", "fix: resolve remaining SMS and SIM issues (#18 #30)")
+    run("git", "push", "origin", f"HEAD:{BRANCH}")
     return 0
 
 
