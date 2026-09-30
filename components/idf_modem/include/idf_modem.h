@@ -13,6 +13,9 @@ struct IdfModemStatus {
     bool modemReady = false;
     bool signalFresh = false;
     bool identityFresh = false;
+    uint32_t sampleRequested = 0;
+    uint32_t sampleCompleted = 0;
+    bool sampleRunning = false;
     std::string phase = "off";
     int ceregStat = -1;
     int csq = -1;
@@ -53,7 +56,7 @@ struct IdfCellularHttpConfig {
 esp_err_t idf_modem_start(const IdfConfig& config);
 esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response);
-esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response);
+esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response, void (*on_submit)() = nullptr);
 esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config, IdfCellularHttpResult& result);
 esp_err_t idf_modem_cellular_http_request(const std::string& url, const char* method,
                                            const char* content_type, const std::string& body,

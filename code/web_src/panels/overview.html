@@ -3,8 +3,9 @@
       <p class="page-subtitle">设备信号、转发与系统状态遥测</p>
       <!-- 信号量表(签名) -->
       <div class="card sig-card" style="margin-bottom:14px">
-          <div class="card-header">信号 SIGNAL<span id="ovRefresh" style="margin-left:auto;color:var(--faint);font-size:10.5px;font-family:var(--mono);font-weight:400;">设备 --</span><button type="button" class="btn btn-secondary btn-sm" style="margin-left:10px;" onclick="refreshModemInfo(this)">刷新模组信息</button></div>
+          <div class="card-header">信号 SIGNAL<span id="ovRefresh" style="margin-left:auto;color:var(--faint);font-size:10.5px;font-family:var(--mono);font-weight:400;">设备 --</span><button type="button" class="btn btn-secondary btn-sm" style="margin-left:10px;" id="modemRefreshButton" onclick="refreshModemInfo(this)">刷新模组信息</button></div>
         <div class="card-body">
+          <div id="modemSampleResult" class="help-text" role="status" aria-live="polite"></div>
           <div class="gauge"><span class="gl">CSQ</span><span class="track"><i class="tk" style="left:26%"></i><i class="tk" style="left:45%"></i><span class="fill" id="gCsq"></span></span><span class="gv" id="gCsqV">--</span></div>
           <div class="gauge"><span class="gl">RSSI</span><span class="track"><i class="tk" style="left:25%"></i><i class="tk" style="left:58%"></i><span class="fill" id="gRssi"></span></span><span class="gv" id="gRssiV">--</span></div>
           <div class="gauge"><span class="gl">RSRP</span><span class="track"><i class="tk" style="left:20%"></i><i class="tk" style="left:50%"></i><span class="fill" id="gRsrp"></span></span><span class="gv" id="gRsrpV">--</span></div>

@@ -1,4 +1,6 @@
 #include "idf_sms.h"
+#include "idf_sms_reply_check.h"
+#include "idf_sms_timestamp.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -63,6 +65,9 @@ struct ConcatSlot {
     std::string sender;
     std::string timestamp;
     int64_t lastUs = 0;
+    int64_t receivedUs = 0;
+    uint32_t receivedEpoch = 0;
+    bool needsSmsc = false;
     std::array<ConcatPart, CONCAT_PARTS> parts;
 };
 
@@ -76,15 +81,19 @@ struct DecodedSms {
     std::string text;
     std::string timestamp;
     int concat[3] = {};
+    int64_t receivedUs = 0;
+    uint32_t receivedEpoch = 0;
 };
 
 static SemaphoreHandle_t s_status_mutex = nullptr;
 static SemaphoreHandle_t s_pdu_mutex = nullptr;
 static SemaphoreHandle_t s_out_mutex = nullptr;
 static IdfSmsStatus s_status;
+static IdfSmsReplyCheck s_reply_check;
 static bool s_started = false;
 static PDU s_pdu(4096);
-static std::array<int, INDEX_QUEUE_MAX> s_index_queue = {};
+struct SmsIndex { int index = 0; int64_t receivedUs = 0; };
+static std::array<SmsIndex, INDEX_QUEUE_MAX> s_index_queue = {};
 static size_t s_index_count = 0;
 static std::array<OutgoingSmsJob, OUT_SMS_QUEUE_MAX> s_out_queue = {};
 static size_t s_out_head = 0;
@@ -95,6 +104,8 @@ static size_t s_seen_filled = 0;
 static std::array<ConcatSlot, CONCAT_SLOTS> s_concat = {};
 static std::string s_urc_carry;
 static bool s_wait_pdu = false;
+static int64_t s_urc_received_us = 0;
+static int64_t s_wait_pdu_received_us = 0;
 static int64_t s_wait_pdu_until_us = 0;   // +CMT 后等 PDU 行的窗口截止(3s，对齐 Arduino)
 static bool s_backfill_pending = false;   // 索引队列溢出/CMGR 失败时，请求一次近期 CMGL 兜底
 static bool s_cnma_error_logged = false;  // 避免异常固件每条直推短信都刷同一条确认失败日志
@@ -350,26 +361,27 @@ static void update_status(bool receive_ready, bool got_sms)
     xSemaphoreGive(s_status_mutex);
 }
 
-static void enqueue_index(int idx)
+static void enqueue_index(int idx, int64_t received_us)
 {
     if (idx < 0) {
         s_backfill_pending = true;  // 非法索引：改由近期 CMGL 兜底(对齐 Arduino storedSmsPending)
         return;
     }
     for (size_t i = 0; i < s_index_count; ++i) {
-        if (s_index_queue[i] == idx) return;
+        if (s_index_queue[i].index == idx) return;
     }
     if (s_index_count < INDEX_QUEUE_MAX) {
-        s_index_queue[s_index_count++] = idx;
+        s_index_queue[s_index_count++] = {idx, received_us};
     } else {
         s_backfill_pending = true;  // 队列满：丢索引但请求 CMGL 兜底，避免最长等 60s
     }
 }
 
-static bool pop_index(int& idx)
+static bool pop_index(int& idx, int64_t& received_us)
 {
     if (s_index_count == 0) return false;
-    idx = s_index_queue[0];
+    idx = s_index_queue[0].index;
+    received_us = s_index_queue[0].receivedUs;
     for (size_t i = 1; i < s_index_count; ++i) s_index_queue[i - 1] = s_index_queue[i];
     --s_index_count;
     return true;
@@ -451,7 +463,7 @@ static std::string assemble_concat(const ConcatSlot& slot)
     return text;
 }
 
-static void process_sms_content(const char* sender_raw, const char* text_raw, const char* timestamp_raw);
+static void process_sms_content(const char* sender_raw, const char* text_raw, const char* timestamp_raw, int64_t received_us, uint32_t received_epoch, bool require_smsc = false);
 
 // 已成功合并的长短信登记环：SIM 满时部分分段被拒收，SMSC 会整条重投(同 ref)。
 // 槽位合并完成后迟到的重复分段若不识别，会重新开槽并在超时后拼出一条
@@ -529,7 +541,7 @@ static ConcatSlot& find_concat_slot(int ref, const std::string& sender, int tota
         if (!partial.empty()) {
             idf_logf("长短信槽位耗尽，先合并已收 %d/%d 段再复用槽位",
                      oldest->received, oldest->total);
-            process_sms_content(oldest->sender.c_str(), partial.c_str(), oldest->timestamp.c_str());
+            process_sms_content(oldest->sender.c_str(), partial.c_str(), oldest->timestamp.c_str(), -1, 0);
         }
     }
     clear_concat_slot(*oldest);
@@ -541,7 +553,7 @@ static ConcatSlot& find_concat_slot(int ref, const std::string& sender, int tota
     return *oldest;
 }
 
-static void process_sms_content(const char* sender_raw, const char* text_raw, const char* timestamp_raw)
+static void process_sms_content(const char* sender_raw, const char* text_raw, const char* timestamp_raw, int64_t received_us, uint32_t received_epoch, bool require_smsc)
 {
     std::string sender = sender_raw ? sender_raw : "";
     std::string text = text_raw ? text_raw : "";
@@ -559,6 +571,12 @@ static void process_sms_content(const char* sender_raw, const char* text_raw, co
     if (seen_recently(hash)) {
         idf_logf("重复短信 %s 已忽略", sender.c_str());
         return;
+    }
+
+    // 去重后的完整短信参与验证，不消费短信，后续收件箱/转发行为保持不变。
+    if (s_status_mutex && xSemaphoreTake(s_status_mutex, portMAX_DELAY) == pdTRUE) {
+        s_reply_check.observe(sender.c_str(), text.c_str(), esp_timer_get_time(), received_us, received_epoch, static_cast<uint32_t>(time(nullptr)), require_smsc);
+        xSemaphoreGive(s_status_mutex);
     }
 
     if (is_admin_sender(sender, cfg)) {
@@ -593,7 +611,7 @@ static void handle_decoded_pdu(const DecodedSms& sms)
     if (total > 1 && part > 0) {
         if (total > static_cast<int>(CONCAT_PARTS) || part > total) {
             idf_logf("长短信分段参数超限 part=%d total=%d，按单条处理", part, total);
-            process_sms_content(sender, text, ts);
+            process_sms_content(sender, text, ts, -1, 0);
             return;
         }
         if (concat_recently_done(ref, sender ? sender : "", total, part,
@@ -618,6 +636,15 @@ static void handle_decoded_pdu(const DecodedSms& sms)
             slot.parts[idx].valid = true;
             slot.parts[idx].text = text ? text : "";
             slot.parts[idx].timestamp = ts ? ts : "";
+            // 保留已知片段的最早到达时间；未知片段另作 SMSC 校验，不能覆盖已知旧片段证据。
+            if (slot.received == 0) {
+                slot.receivedUs = sms.receivedUs;
+                slot.needsSmsc = sms.receivedUs == 0;
+            } else {
+                if (sms.receivedUs > 0) slot.receivedUs = slot.receivedUs > 0 ? std::min(slot.receivedUs, sms.receivedUs) : sms.receivedUs;
+                slot.needsSmsc = slot.needsSmsc || sms.receivedUs == 0;
+            }
+            slot.receivedEpoch = slot.received == 0 ? sms.receivedEpoch : std::min(slot.receivedEpoch, sms.receivedEpoch);
             slot.received++;
             slot.lastUs = esp_timer_get_time();
             if (slot.timestamp.empty()) slot.timestamp = ts ? ts : "";
@@ -626,16 +653,16 @@ static void handle_decoded_pdu(const DecodedSms& sms)
         if (slot.received >= slot.total) {
             record_concat_done(slot);
             std::string full = assemble_concat(slot);
-            process_sms_content(slot.sender.c_str(), full.c_str(), slot.timestamp.c_str());
+            process_sms_content(slot.sender.c_str(), full.c_str(), slot.timestamp.c_str(), slot.receivedUs, slot.receivedEpoch, slot.needsSmsc);
             clear_concat_slot(slot);
         }
         return;
     }
 
-    process_sms_content(sender, text, ts);
+    process_sms_content(sender, text, ts, sms.receivedUs, sms.receivedEpoch);
 }
 
-static bool decode_pdu_line(const std::string& line)
+static bool decode_pdu_line(const std::string& line, int64_t received_us = 0)
 {
     if (!is_hex_string(line)) return false;
     if (!s_pdu_mutex) return false;
@@ -656,6 +683,8 @@ static bool decode_pdu_line(const std::string& line)
     decoded.sender = s_pdu.getSender();
     decoded.text = s_pdu.getText();
     decoded.timestamp = s_pdu.getTimeStamp();
+    decoded.receivedUs = received_us;
+    decoded.receivedEpoch = idf_sms_timestamp_epoch(decoded.timestamp.c_str());
     int* concat = s_pdu.getConcatInfo();
     if (concat) {
         decoded.concat[0] = concat[0];
@@ -685,7 +714,7 @@ static void expire_concat_slots()
         std::string full = assemble_concat(slot);
         if (!full.empty()) {
             idf_logf("长短信等待超时，已合并现有 %d/%d 段", slot.received, slot.total);
-            process_sms_content(slot.sender.c_str(), full.c_str(), slot.timestamp.c_str());
+            process_sms_content(slot.sender.c_str(), full.c_str(), slot.timestamp.c_str(), -1, 0);
         }
         clear_concat_slot(slot);
     }
@@ -786,6 +815,10 @@ static void process_urc_line(const std::string& raw)
 {
     std::string line = idf_util_trim_copy(raw);
     if (line.empty()) return;
+    if (starts_with(line, "@RXUS:")) {
+        s_urc_received_us = strtoll(line.c_str() + 6, nullptr, 10);
+        return;
+    }
 
     // 来电通知：RING/+CLIP 优先处理并返回，独立于短信 PDU 等待逻辑
     if (line == "RING" || starts_with(line, "+CLIP:")) {
@@ -801,14 +834,15 @@ static void process_urc_line(const std::string& raw)
             size_t comma = line.rfind(',');
             idf_logf("收到直推短信头，TPDU 长度=%d",
                      comma == std::string::npos ? -1 : atoi(line.c_str() + comma + 1));
+            s_wait_pdu_received_us = s_urc_received_us;
             s_wait_pdu_until_us = esp_timer_get_time() + 3LL * 1000LL * 1000LL;
             return;
         }
         if (starts_with(line, "+CMTI:")) {
-            enqueue_index(parse_cmti_index(line));
+            enqueue_index(parse_cmti_index(line), s_urc_received_us);
             return;
         }
-        if (decode_pdu_line(line)) {
+        if (decode_pdu_line(line, s_wait_pdu_received_us)) {
             s_wait_pdu = false;
             // ML307R 的 +CNMI 文档要求直推短信通过 +CNMA 确认，确认后模组才会可靠地
             // 继续上报同一条长短信的后续分段。存储读取(CMGR/CMGL)不走此分支。
@@ -834,9 +868,10 @@ static void process_urc_line(const std::string& raw)
         idf_logf("收到直推短信头，TPDU 长度=%d",
                  comma == std::string::npos ? -1 : atoi(line.c_str() + comma + 1));
         s_wait_pdu = true;
+        s_wait_pdu_received_us = s_urc_received_us;
         s_wait_pdu_until_us = esp_timer_get_time() + 3LL * 1000LL * 1000LL;  // 3s 窗口
     } else if (starts_with(line, "+CMTI:")) {
-        enqueue_index(parse_cmti_index(line));
+        enqueue_index(parse_cmti_index(line), s_urc_received_us);
     }
 }
 
@@ -890,7 +925,7 @@ static bool extract_first_stored_pdu(const std::string& resp, const char* header
     return false;
 }
 
-static void fetch_stored_sms_by_index(int idx)
+static void fetch_stored_sms_by_index(int idx, int64_t received_us)
 {
     if (idx < 0) return;
     char cmd[24];
@@ -900,7 +935,7 @@ static void fetch_stored_sms_by_index(int idx)
     bool has_header = resp.find("+CMGR:") != std::string::npos;
     std::string pdu_line;
     bool has_pdu_line = extract_first_stored_pdu(resp, "+CMGR:", pdu_line);
-    bool decoded = has_pdu_line && decode_pdu_line(pdu_line);
+    bool decoded = has_pdu_line && decode_pdu_line(pdu_line, received_us);
     if (has_header) {
         if (decoded) {
             snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", idx);
@@ -1104,8 +1139,9 @@ static void sms_task(void*)
             }
 
             int idx = -1;
-            if (pop_index(idx)) {
-                fetch_stored_sms_by_index(idx);
+            int64_t received_us = 0;
+            if (pop_index(idx, received_us)) {
+                fetch_stored_sms_by_index(idx, received_us);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 continue;
             }
@@ -1268,7 +1304,15 @@ static std::string sms_submit_failure_detail(esp_err_t err, const std::string& r
     return esp_err_to_name(err);
 }
 
-esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& text_raw, std::string& message)
+static void reply_check_submitted()
+{
+    if (!s_status_mutex) return;
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    s_reply_check.submitted(esp_timer_get_time(), static_cast<uint32_t>(time(nullptr)));
+    xSemaphoreGive(s_status_mutex);
+}
+
+esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& text_raw, std::string& message, bool track_reply)
 {
     message.clear();
     std::string phone = idf_util_trim_copy(phone_raw);
@@ -1330,7 +1374,8 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
         char cmd[32];
         snprintf(cmd, sizeof(cmd), "AT+CMGS=%d", pdu_len);
         std::string resp;
-        err = idf_modem_send_pdu(cmd, sms_pdu.c_str(), SMS_SUBMIT_TIMEOUT_MS, resp);
+        err = idf_modem_send_pdu(cmd, sms_pdu.c_str(), SMS_SUBMIT_TIMEOUT_MS, resp,
+                                 track_reply && i + 1 == parts.size() ? reply_check_submitted : nullptr);
         if (err != ESP_OK) {
             std::string detail = sms_submit_failure_detail(err, resp);
             if (parts.size() > 1) {
@@ -1429,4 +1474,40 @@ IdfSmsStatus idf_sms_get_status(void)
         xSemaphoreGive(s_status_mutex);
     }
     return copy;
+}
+
+bool idf_sms_reply_check_begin(const std::string& sender_pattern, const std::string& body_pattern)
+{
+    if (!s_status_mutex) return false;
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    bool ok = s_reply_check.begin(idf_config_translate_perl_classes(sender_pattern),
+                                  idf_config_translate_perl_classes(body_pattern));
+    xSemaphoreGive(s_status_mutex);
+    return ok;
+}
+
+void idf_sms_reply_check_arm(int timeout_seconds)
+{
+    if (!s_status_mutex) return;
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    s_reply_check.arm(esp_timer_get_time(), timeout_seconds);
+    xSemaphoreGive(s_status_mutex);
+}
+
+int idf_sms_reply_check_poll(void)
+{
+    if (!s_status_mutex) return -1;
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    auto state = s_reply_check.poll(esp_timer_get_time());
+    xSemaphoreGive(s_status_mutex);
+    return state == IdfSmsReplyCheck::State::Matched ? 1 :
+           state == IdfSmsReplyCheck::State::Waiting ? 0 : -1;
+}
+
+void idf_sms_reply_check_cancel(void)
+{
+    if (!s_status_mutex) return;
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    s_reply_check.cancel();
+    xSemaphoreGive(s_status_mutex);
 }
