@@ -10,13 +10,19 @@ import subprocess
 import sys
 
 
-PATCH_RELATIVE_PATH = Path(
-    "patches/mbedtls/0001-x509-parse-all-certificate-policy-oids.patch"
+# 每个 patch 的目标目录相对于 ESP-IDF 根目录；Mbed TLS 是独立子模块。
+PATCHES = (
+    (Path("components/mbedtls/mbedtls"), Path(
+        "patches/mbedtls/0001-x509-parse-all-certificate-policy-oids.patch"
+    )),
+    (Path("."), Path(
+        "patches/esp-idf/0001-crt-bundle-cross-signed-memory-leak.patch"
+    )),
 )
 
 
 def git_apply_check(repo: Path, patch: Path, reverse: bool = False) -> tuple[bool, str]:
-    args = ["apply", "--check"]
+    args = ["apply", "--check", "--whitespace=error"]
     if reverse:
         args.append("--reverse")
     args.append(str(patch))
@@ -41,19 +47,14 @@ def resolve_idf_path(value: str | None) -> Path:
     raise RuntimeError("未提供 --idf-path，且环境变量 IDF_PATH 未设置")
 
 
-def apply_patch(repo_root: Path, idf_path: Path, check_only: bool) -> None:
-    mbedtls_path = idf_path / "components" / "mbedtls" / "mbedtls"
-    patch_path = repo_root / PATCH_RELATIVE_PATH
-
-    if not idf_path.is_dir():
-        raise RuntimeError(f"ESP-IDF 路径不存在: {idf_path}")
-    if not mbedtls_path.is_dir():
-        raise RuntimeError(f"ESP-IDF vendored Mbed TLS 路径不存在: {mbedtls_path}")
+def apply_one_patch(target: Path, patch_path: Path, check_only: bool) -> None:
+    if not target.is_dir():
+        raise RuntimeError(f"SDK patch 目标目录不存在: {target}")
     if not patch_path.is_file():
         raise RuntimeError(f"项目 patch 不存在: {patch_path}")
 
     # 不绑定外部 SDK 的 Git commit；只要求 patch 上下文完整匹配。
-    can_apply, apply_detail = git_apply_check(mbedtls_path, patch_path)
+    can_apply, apply_detail = git_apply_check(target, patch_path)
     if can_apply:
         if check_only:
             print(f"patch 可应用: {patch_path}")
@@ -63,7 +64,7 @@ def apply_patch(repo_root: Path, idf_path: Path, check_only: bool) -> None:
             [
                 "git",
                 "-C",
-                str(mbedtls_path),
+                str(target),
                 "apply",
                 "--whitespace=error",
                 str(patch_path),
@@ -72,12 +73,12 @@ def apply_patch(repo_root: Path, idf_path: Path, check_only: bool) -> None:
             text=True,
         )
         if result.returncode != 0:
-            raise RuntimeError("应用 ESP-IDF Mbed TLS patch 失败")
+            raise RuntimeError("应用 ESP-IDF patch 失败")
         print(f"已应用 patch: {patch_path}")
         return
 
     already_applied, reverse_detail = git_apply_check(
-        mbedtls_path, patch_path, reverse=True
+        target, patch_path, reverse=True
     )
     if already_applied:
         print(f"patch 已经应用: {patch_path}")
@@ -89,6 +90,17 @@ def apply_patch(repo_root: Path, idf_path: Path, check_only: bool) -> None:
         "拒绝 fuzzy/部分应用。\n"
         f"patch: {patch_path}\n{detail}"
     )
+
+
+def apply_patch(repo_root: Path, idf_path: Path, check_only: bool) -> None:
+    if not idf_path.is_dir():
+        raise RuntimeError(f"ESP-IDF 路径不存在: {idf_path}")
+    # 先检查全部 patch，避免上下文不匹配时留下部分打补丁的 SDK。
+    for target, patch in PATCHES:
+        apply_one_patch(idf_path / target, repo_root / patch, True)
+    if not check_only:
+        for target, patch in PATCHES:
+            apply_one_patch(idf_path / target, repo_root / patch, False)
 
 
 def main() -> int:
