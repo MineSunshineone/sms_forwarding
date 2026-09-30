@@ -20,5 +20,11 @@ python -m unittest discover -s tools/tests -v
 python tools/build_web_assets.py --check
 ```
 
-有 `IDF_PATH` 时测试会额外检查真实 SDK 源码能否应用；固件 CI 使用固定 v6.0.2 编译。
+有 `IDF_PATH` 时，请先应用补丁再运行测试；测试会额外检查真实 SDK 补丁状态，
+并提取实际 CA 回调编译主机测试（6,000 次创建/释放及分配、密钥解析失败路径）。
+固件 CI 使用固定 v6.0.2 运行上述测试并编译。单独运行回调测试：
+
+```bash
+python tools/tests/test_crt_bundle_callback.py --idf-path "$IDF_PATH" -v
+```
 主机测试不能代替 ESP32-C3 长时间运行测试。对于 issue #33 的衍生 HTTPS 轮询程序，仍需在相同轮询频率、证书链和网络条件下检查空闲堆、最低堆与重启情况；不要将主机测试或构建成功描述为已完成设备复现。
