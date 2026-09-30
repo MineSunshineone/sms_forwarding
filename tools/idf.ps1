@@ -33,6 +33,9 @@ $env:IDF_TOOLS_PATH = $IdfToolsPath
 
 # 在外部 ESP-IDF 源码上应用项目维护的兼容 patch；由 git apply 严格检查上下文。
 python (Join-Path $RepoRoot 'tools\apply_idf_patches.py') --idf-path $IdfPath
+if ($LASTEXITCODE -ne 0) {
+    throw 'ESP-IDF patch application failed; refusing to build unpatched firmware'
+}
 
 $IdfArgs = @('-B', $BuildDir, '-D', "SDKCONFIG=$SdkConfig")
 

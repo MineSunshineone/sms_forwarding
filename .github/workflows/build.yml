@@ -27,6 +27,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      - name: Test SDK patch application
+        run: |
+          python tools/apply_idf_patches.py --idf-path "$IDF_PATH"
+          python -m unittest discover -s tools/tests -v
+
       - name: Verify generated web assets
         run: python tools/build_web_assets.py --check
 
