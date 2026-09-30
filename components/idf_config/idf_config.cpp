@@ -273,6 +273,10 @@ static void normalize_config(IdfConfig& c)
         if (t.action > 3) t.action = 0;
         limit_utf8_bytes(t.target, 128);
         limit_utf8_bytes(t.payload, 128);
+        t.startMinute = clamp_int(t.startMinute, -1, 1439);
+        t.replyTimeoutSec = clamp_int(t.replyTimeoutSec, 5, 3600);
+        limit_utf8_bytes(t.replySender, 128);
+        limit_utf8_bytes(t.replyBody, 128);
     }
 }
 
@@ -602,6 +606,12 @@ esp_err_t idf_config_load(void)
             t.action = read_u8(nvs, key("Act").c_str(), 0);
             t.target = read_str(nvs, key("Tgt").c_str(), "", 128);
             t.payload = read_str(nvs, key("Pay").c_str(), "", 128);
+            t.startMinute = read_i32(nvs, key("Time").c_str(), -1);
+            t.checkSystem = read_bool(nvs, key("Sys").c_str(), false);
+            t.checkReply = read_bool(nvs, key("Reply").c_str(), false);
+            t.replySender = read_str(nvs, key("Sender").c_str(), "", 128);
+            t.replyBody = read_str(nvs, key("Body").c_str(), "", 128);
+            t.replyTimeoutSec = read_i32(nvs, key("Timeout").c_str(), 300);
             t.lastRun = read_u32(nvs, key("Last").c_str(), 0);
         }
 
@@ -760,6 +770,18 @@ std::string idf_config_export_text(bool full_export)
         append_kv(out, key, t.target);
         snprintf(key, sizeof(key), "st%dPay", i);
         append_kv(out, key, t.payload);
+        snprintf(key, sizeof(key), "st%dTime", i);
+        append_kv_i(out, key, t.startMinute);
+        snprintf(key, sizeof(key), "st%dSys", i);
+        append_kv_i(out, key, t.checkSystem ? 1 : 0);
+        snprintf(key, sizeof(key), "st%dReply", i);
+        append_kv_i(out, key, t.checkReply ? 1 : 0);
+        snprintf(key, sizeof(key), "st%dSender", i);
+        append_kv(out, key, t.replySender);
+        snprintf(key, sizeof(key), "st%dBody", i);
+        append_kv(out, key, t.replyBody);
+        snprintf(key, sizeof(key), "st%dTimeout", i);
+        append_kv_i(out, key, t.replyTimeoutSec);
         snprintf(key, sizeof(key), "st%dLast", i);
         append_kv_u32(out, key, t.lastRun);
     }
@@ -842,6 +864,12 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
         else if (suffix == "Act") import_u8_field(t.action, value);
         else if (suffix == "Tgt") t.target = value;
         else if (suffix == "Pay") t.payload = value;
+        else if (suffix == "Time") import_int_field(t.startMinute, value);
+        else if (suffix == "Sys") t.checkSystem = bool_from_text(value);
+        else if (suffix == "Reply") t.checkReply = bool_from_text(value);
+        else if (suffix == "Sender") t.replySender = value;
+        else if (suffix == "Body") t.replyBody = value;
+        else if (suffix == "Timeout") import_int_field(t.replyTimeoutSec, value);
         else if (suffix == "Last") import_u32_field(t.lastRun, value);
     }
     else if (key.rfind("push", 0) == 0) {
@@ -894,6 +922,9 @@ esp_err_t idf_config_import_text(const std::string& text, int* applied_count)
         pos = end + 1;
     }
 
+    for (const auto& task : next.schedTasks) {
+        if (!idf_config_validate_sched_task(task)) return ESP_ERR_INVALID_ARG;
+    }
     next.wifiFromFallback = false;
     esp_err_t err = commit_config_update(next, base);
     if (err == ESP_OK && applied_count) *applied_count = applied;
@@ -975,11 +1006,12 @@ esp_err_t idf_config_set_sched_last(int index, uint32_t epoch)
         nvs_close(nvs);
     }
 
-    if (err == ESP_OK) {
-        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-        s_config.schedTasks[index].lastRun = epoch;
-        xSemaphoreGive(s_config_mutex);
-    }
+    // 已尝试的动作必须留在本次运行的状态里；NVS 满/写失败不能触发每 5s 重发收费短信。
+    // 仍向调用者返回持久化错误，断电后的保护无法替代损坏存储上的真实落盘。
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    s_config.schedTasks[index].lastRun = epoch;
+    xSemaphoreGive(s_config_mutex);
+    if (err != ESP_OK) idf_logf("定时任务%d执行时间保存失败，仅保留本次运行标记: %s", index + 1, esp_err_to_name(err));
     xSemaphoreGive(s_persist_mutex);
     return err;
 }
@@ -1146,6 +1178,12 @@ static esp_err_t save_config_to_nvs(const IdfConfig& c)
         if (err == ESP_OK) err = nvs_set_u8(nvs, key("Act").c_str(), t.action);
         if (err == ESP_OK) err = write_str(nvs, key("Tgt").c_str(), t.target);
         if (err == ESP_OK) err = write_str(nvs, key("Pay").c_str(), t.payload);
+        if (err == ESP_OK) err = nvs_set_i32(nvs, key("Time").c_str(), t.startMinute);
+        if (err == ESP_OK) err = nvs_set_u8(nvs, key("Sys").c_str(), t.checkSystem ? 1 : 0);
+        if (err == ESP_OK) err = nvs_set_u8(nvs, key("Reply").c_str(), t.checkReply ? 1 : 0);
+        if (err == ESP_OK) err = write_str(nvs, key("Sender").c_str(), t.replySender);
+        if (err == ESP_OK) err = write_str(nvs, key("Body").c_str(), t.replyBody);
+        if (err == ESP_OK) err = nvs_set_i32(nvs, key("Timeout").c_str(), t.replyTimeoutSec);
         if (err == ESP_OK) err = nvs_set_u32(nvs, key("Last").c_str(), t.lastRun);
     }
 
@@ -1642,11 +1680,34 @@ esp_err_t idf_config_save_system_schedule(bool reboot_enabled, int reboot_hour,
     return err;
 }
 
+bool idf_config_validate_sched_task(const IdfSchedTask& t, std::string* message)
+{
+    auto fail = [&](const char* text) { if (message) *message = text; return false; };
+    if (t.startMinute < -1 || t.startMinute > 1439) return fail("任务发送时刻无效");
+    if (t.replyTimeoutSec < 5 || t.replyTimeoutSec > 3600) return fail("回复超时应为 5–3600 秒");
+    if (t.replySender.size() > 128 || t.replyBody.size() > 128) return fail("回复正则最长 128 字节");
+    if (t.checkReply && t.action != 2) return fail("回复检测仅支持发送短信任务");
+    if (t.checkReply && t.replySender.empty() && t.replyBody.empty()) return fail("至少填写一个回复正则");
+    if (!t.checkReply) return true;
+    for (const auto* pattern : {&t.replySender, &t.replyBody}) {
+        if (pattern->empty()) continue;
+        regex_t compiled;
+        std::string translated = idf_config_translate_perl_classes(*pattern);
+        if (regcomp(&compiled, translated.c_str(), REG_EXTENDED | REG_NOSUB) != 0)
+            return fail("回复正则格式无效（使用 POSIX 扩展语法）");
+        regfree(&compiled);
+    }
+    return true;
+}
+
 esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TASKS])
 {
     esp_err_t mutex_err = ensure_config_mutex();
     if (mutex_err != ESP_OK) return mutex_err;
 
+    for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
+        if (!idf_config_validate_sched_task(tasks[i])) return ESP_ERR_INVALID_ARG;
+    }
     IdfSchedTask next[IDF_MAX_SCHED_TASKS];
     bool was_enabled[IDF_MAX_SCHED_TASKS] = {};
     uint32_t last_run[IDF_MAX_SCHED_TASKS] = {};
@@ -1690,6 +1751,12 @@ esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TAS
         if (err == ESP_OK) err = nvs_set_u8(nvs, key("Act").c_str(), t.action);
         if (err == ESP_OK) err = write_str(nvs, key("Tgt").c_str(), t.target);
         if (err == ESP_OK) err = write_str(nvs, key("Pay").c_str(), t.payload);
+        if (err == ESP_OK) err = nvs_set_i32(nvs, key("Time").c_str(), t.startMinute);
+        if (err == ESP_OK) err = nvs_set_u8(nvs, key("Sys").c_str(), t.checkSystem ? 1 : 0);
+        if (err == ESP_OK) err = nvs_set_u8(nvs, key("Reply").c_str(), t.checkReply ? 1 : 0);
+        if (err == ESP_OK) err = write_str(nvs, key("Sender").c_str(), t.replySender);
+        if (err == ESP_OK) err = write_str(nvs, key("Body").c_str(), t.replyBody);
+        if (err == ESP_OK) err = nvs_set_i32(nvs, key("Timeout").c_str(), t.replyTimeoutSec);
         if (err == ESP_OK) err = nvs_set_u32(nvs, key("Last").c_str(), t.lastRun);
     }
     err = commit_field_save(nvs, err, "自定义定时任务");

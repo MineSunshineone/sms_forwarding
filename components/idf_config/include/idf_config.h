@@ -46,6 +46,12 @@ struct IdfSchedTask {
     uint8_t action = 0;      // 0=推送提醒 1=蜂窝HTTP ping 2=发短信 3=USSD
     std::string target;      // ping URL / 短信号码 / USSD 码
     std::string payload;     // 推送/短信内容
+    int startMinute = -1;    // -1=沿用间隔时长；0..1439=到期日当地时分
+    bool checkSystem = false; // 执行前检测系统短信组件
+    bool checkReply = false;  // 发短信后验证收到的回复
+    std::string replySender; // 发件人正则；与正文正则为“或”关系
+    std::string replyBody;   // 正文正则
+    int replyTimeoutSec = 300;
     uint32_t lastRun = 0;    // 基准时间（epoch），0=未建立
 };
 
@@ -143,6 +149,7 @@ esp_err_t idf_config_save_system_schedule(bool reboot_enabled, int reboot_hour,
                                           bool hb_enabled, int hb_hour,
                                           bool sms_health_enabled, int sms_health_hour,
                                           bool sms_health_notify);
+bool idf_config_validate_sched_task(const IdfSchedTask& task, std::string* message = nullptr);
 esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TASKS]);
 esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std::string& apn,
                               const std::string& operator_plmn, const std::string& phone_number,
