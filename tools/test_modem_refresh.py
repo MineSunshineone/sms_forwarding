@@ -32,5 +32,6 @@ with tempfile.TemporaryDirectory(prefix='test-modem-', dir=ROOT / 'build') as te
     cpp.write_text(fixture)
     subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
                     '-I', str(ROOT / 'components/idf_modem/include'),
+                    '-I', str(ROOT / 'components/idf_config/include'),
                     str(cpp), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

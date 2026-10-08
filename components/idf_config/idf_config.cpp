@@ -1,4 +1,5 @@
 #include "idf_config.h"
+#include "idf_iccid.h"
 
 #include <algorithm>
 #include <cstring>
@@ -148,10 +149,42 @@ static void limit_utf8_bytes(std::string& value, size_t max_len)
     value.resize(end);
 }
 
+// 凭据主键必须完整读取；通用字符串读取的截断策略不能用于 ICCID。
+static std::string read_iccid(nvs_handle_t nvs, const char* key)
+{
+    size_t len = 0;
+    if (nvs_get_str(nvs, key, nullptr, &len) != ESP_OK || len < 19 || len > 23) return {};
+    std::string value(len, '\0');
+    if (nvs_get_str(nvs, key, value.data(), &len) != ESP_OK ||
+        len != value.size() || value.back() != '\0') return {};
+    value.pop_back();
+    return idf_normalize_iccid(value);
+}
+
 static bool digits_only(const std::string& value, size_t min_len, size_t max_len)
 {
     if (value.size() < min_len || value.size() > max_len) return false;
     return std::all_of(value.begin(), value.end(), [](unsigned char ch) { return isdigit(ch); });
+}
+
+static void sanitize_sim_credentials(IdfConfig& c)
+{
+    int w = 0;
+    for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+        IdfSimCredential item = c.simCredentials[i];
+        item.iccid = idf_normalize_iccid(item.iccid);
+        if (item.iccid.empty()) continue;
+        if (!item.pin.empty() && !digits_only(item.pin, 4, 8)) item.pin.clear();
+        if (!item.puk.empty() && !digits_only(item.puk, 8, 8)) item.puk.clear();
+        item.pinMaxAttempts = static_cast<uint8_t>(clamp_int(item.pinMaxAttempts, 1, 2));
+        item.pukMaxAttempts = static_cast<uint8_t>(clamp_int(item.pukMaxAttempts, 1, 5));
+        item.pinFailedAttempts = std::min(item.pinFailedAttempts, item.pinMaxAttempts);
+        item.pukFailedAttempts = std::min(item.pukFailedAttempts, item.pukMaxAttempts);
+        bool duplicate = false;
+        for (int j = 0; j < w; ++j) duplicate = duplicate || c.simCredentials[j].iccid == item.iccid;
+        if (!duplicate) c.simCredentials[w++] = std::move(item);
+    }
+    for (; w < IDF_MAX_SIM_CREDENTIALS; ++w) c.simCredentials[w] = IdfSimCredential();
 }
 
 static constexpr bool wifi_tx_power_valid(uint8_t power)
@@ -236,23 +269,7 @@ static void normalize_config(IdfConfig& c)
     limit_utf8_bytes(c.operatorPlmn, 16);
     limit_utf8_bytes(c.phoneNumber, 64);
 
-    {
-        int w = 0;
-        for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
-            IdfSimCredential item = c.simCredentials[i];
-            if (!digits_only(item.iccid, 15, 22)) continue;
-            if (!item.pin.empty() && !digits_only(item.pin, 4, 8)) item.pin.clear();
-            if (!item.puk.empty() && !digits_only(item.puk, 8, 8)) item.puk.clear();
-            item.pinMaxAttempts = static_cast<uint8_t>(clamp_int(item.pinMaxAttempts, 1, 2));
-            item.pukMaxAttempts = static_cast<uint8_t>(clamp_int(item.pukMaxAttempts, 1, 5));
-            item.pinFailedAttempts = std::min(item.pinFailedAttempts, item.pinMaxAttempts);
-            item.pukFailedAttempts = std::min(item.pukFailedAttempts, item.pukMaxAttempts);
-            bool duplicate = false;
-            for (int j = 0; j < w; ++j) duplicate = duplicate || c.simCredentials[j].iccid == item.iccid;
-            if (!duplicate) c.simCredentials[w++] = std::move(item);
-        }
-        for (; w < IDF_MAX_SIM_CREDENTIALS; ++w) c.simCredentials[w] = IdfSimCredential();
-    }
+    sanitize_sim_credentials(c);
 
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         IdfPushChannel& ch = c.pushChannels[i];
@@ -564,7 +581,7 @@ esp_err_t idf_config_load(void)
         for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
             char key[20];
             IdfSimCredential& item = next.simCredentials[i];
-            snprintf(key, sizeof(key), "sim%dIccid", i); item.iccid = read_str(nvs, key, "", 22);
+            snprintf(key, sizeof(key), "sim%dIccid", i); item.iccid = read_iccid(nvs, key);
             snprintf(key, sizeof(key), "sim%dPin", i); item.pin = read_str(nvs, key, "", 8);
             snprintf(key, sizeof(key), "sim%dPuk", i); item.puk = read_str(nvs, key, "", 8);
             snprintf(key, sizeof(key), "sim%dPinMax", i); item.pinMaxAttempts = read_u8(nvs, key, 1);
@@ -1786,7 +1803,8 @@ esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std
             next_credentials[i] = IdfSimCredential();
             continue;
         }
-        if (!digits_only(next_credentials[i].iccid, 15, 22) ||
+        next_credentials[i].iccid = idf_normalize_iccid(next_credentials[i].iccid);
+        if (next_credentials[i].iccid.empty() ||
             (!next_credentials[i].pin.empty() && !digits_only(next_credentials[i].pin, 4, 8)) ||
             (!next_credentials[i].puk.empty() && !digits_only(next_credentials[i].puk, 8, 8))) {
             return ESP_ERR_INVALID_ARG;
@@ -1857,6 +1875,8 @@ esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std
 
 esp_err_t idf_config_record_sim_unlock_result(const std::string& iccid, bool puk, bool success)
 {
+    const std::string key_iccid = idf_normalize_iccid(iccid);
+    if (key_iccid.empty()) return ESP_ERR_INVALID_ARG;
     nvs_handle_t nvs = 0;
     esp_err_t err = begin_field_save(&nvs);
     if (err != ESP_OK) return err;
@@ -1864,7 +1884,7 @@ esp_err_t idf_config_record_sim_unlock_result(const std::string& iccid, bool puk
     int index = -1;
     uint8_t value = 0;
     for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
-        if (current.simCredentials[i].iccid != iccid) continue;
+        if (current.simCredentials[i].iccid != key_iccid) continue;
         index = i;
         uint8_t old = puk ? current.simCredentials[i].pukFailedAttempts
                           : current.simCredentials[i].pinFailedAttempts;
@@ -1884,7 +1904,7 @@ esp_err_t idf_config_record_sim_unlock_result(const std::string& iccid, bool puk
     err = commit_field_save(nvs, err, "SIM 解锁计数");
     if (err == ESP_OK) {
         xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-        if (s_config.simCredentials[index].iccid == iccid) {
+        if (s_config.simCredentials[index].iccid == key_iccid) {
             if (puk) s_config.simCredentials[index].pukFailedAttempts = value;
             else s_config.simCredentials[index].pinFailedAttempts = value;
         }
@@ -2047,10 +2067,12 @@ IdfSimSettingsView idf_config_get_sim_settings_view(void)
 IdfSimUnlockView idf_config_get_sim_unlock_view(const std::string& iccid)
 {
     IdfSimUnlockView view;
+    const std::string key_iccid = idf_normalize_iccid(iccid);
+    if (key_iccid.empty()) return view;
     if (ensure_config_mutex() != ESP_OK) return view;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
     for (const auto& item : s_config.simCredentials) {
-        if (item.iccid == iccid) {
+        if (item.iccid == key_iccid) {
             view.found = true;
             view.credential = item;
             break;

@@ -111,7 +111,7 @@
       for (var i = 0; i < 5; i++) {
         var item = items[i] || {}, idx = String(i);
         html += '<div class="sim-credential">';
-        html += '<div class="form-group"><label>ICCID ' + (i + 1) + '</label><input class="form-input" name="sim' + idx + 'Iccid" inputmode="numeric" maxlength="22" value="' + htmlEsc(item.iccid || '') + '" placeholder="完整 ICCID；留空删除本行"></div>';
+        html += '<div class="form-group"><label>ICCID ' + (i + 1) + '</label><input class="form-input" name="sim' + idx + 'Iccid" inputmode="text" autocapitalize="characters" spellcheck="false" maxlength="22" value="' + htmlEsc(item.iccid || '') + '" placeholder="完整 ICCID；留空删除本行"></div>';
         html += '<div class="sim-credential-grid">';
         html += '<div class="form-group"><label>PIN</label><input class="form-input" type="password" name="sim' + idx + 'Pin" inputmode="numeric" minlength="4" maxlength="8" autocomplete="new-password" placeholder="' + (item.pinSet ? '已保存，留空不修改' : '4–8 位数字') + '"></div>';
         html += '<div class="form-group"><label>PIN 最大失败次数</label><input class="form-input" type="number" name="sim' + idx + 'PinMax" min="1" max="2" value="' + (item.pinMax || 1) + '"></div>';
@@ -909,11 +909,6 @@
       });
     }
     // ---- Keep-Alive (保号) ----
-    function normalizeKaUrlForDisplay(url) {
-      url = url || '';
-      if (url.indexOf('gg.incrafttime.top/api/payload') >= 0) url = url.replace('size=128684', 'size=64342');
-      return url;
-    }
     function kaLoadStatus() {
       fetch('/keepalive?action=status&_=' + Date.now(), {cache:'no-store'}).then(jsonOrThrow).then(function(d) {
         var el = document.getElementById('kaEnabled'); if (el) el.checked = !!d.enabled;
@@ -921,7 +916,7 @@
         el = document.getElementById('kaAction'); if (el) el.value = d.action;
         el = document.getElementById('kaTarget'); if (el) el.value = d.target || '';
         profInit('kaProfile', d.profile || '');
-        var kaUrl = normalizeKaUrlForDisplay(d.url);
+        var kaUrl = d.url || '';
         el = document.getElementById('kaUrl'); if (el) el.value = kaUrl;
         el = document.getElementById('pingUrl'); if (el) el.value = kaUrl;
         kaSyncHead();

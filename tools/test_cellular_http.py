@@ -17,7 +17,7 @@ fixture = fixture.replace('// @解析函数@', '\n'.join(function(name) for name
     'parse_long_token(', 'parse_comma_longs(', 'starts_with(', 'mhttp_error_detail(',
     'parse_mhttp_head(', 'comma_count(', 'wait_mhttp_download_locked(',
     'restore_cellular_data_locked(', 'parse_http_url(', 'apn_valid_for_at(',
-    'normalize_keepalive_payload_size(', 'append_no_cache_query(',
+    'normalize_keepalive_url(', 'append_no_cache_query(',
 ]))
 fixture = fixture.replace('// @实际HTTP函数@', '\n'.join(function(name) for name in ['hex_nibble(', 'hex_encode_ascii(', 'parse_mhttp_create_id(', 'send_mhttp_header_locked(']) + '\n' + function('fetch_mhttp_once_locked(').replace('fetch_mhttp_once_locked(', 'real_fetch_mhttp_once_locked(', 1))
 fixture = fixture.replace('// @生命周期函数@', function('cellular_http_request_impl('))
