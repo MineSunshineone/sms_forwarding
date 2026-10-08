@@ -104,9 +104,19 @@ void test_slow_iccid_and_fallbacks()
     replies.back().body = "+CRSM: 98,4,\"986800214365870921F3\"\r\nOK";
     reply_index = 0;
     assert(query_current_iccid().empty());
-    assert(logs.back().find("响应无有效卡号") != std::string::npos);
+    assert(logs.back().find("sw1=98 sw2=4") != std::string::npos);
     assert(parse_iccid_response("+MCCID: 0,\"" + iccid + "\",1\r\nOK") == iccid);
+    assert(parse_iccid_response("AT+MCCID\r\n+CEREG: 1\r\n+MCCID: " + iccid + "\r\nOK") == iccid);
+    assert(parse_iccid_response("+CMT: ,40\r\n0011223344556677889A\r\n+MCCID: invalid\r\nOK").empty());
+    assert(parse_iccid_response("+CMT: ,10\r\n" + iccid + "\r\nOK").empty());
+    assert(parse_iccid_response("+MCCID: X" + iccid + "Y\r\nOK").empty());
+    assert(parse_iccid_response("+MCCID: 898602F61324F5013007\r\nOK").empty());
+    assert(parse_iccid_response(iccid + "\r\nOK") == iccid);
     assert(parse_iccid_crsm_response("+CRSM: 144,0,\"986800214365870921FF\"").empty());
+    assert(parse_iccid_crsm_response("+CRSM: 145,27,\"986800214365870921F3\"") == iccid);
+    assert(parse_iccid_crsm_response("+CRSM: 145,256,\"986800214365870921F3\"").empty());
+    assert(parse_iccid_crsm_response("+CRSM: 144,1,\"986800214365870921F3\"").empty());
+    assert(parse_iccid_crsm_response("+CRSM: 144,0\r\n+OTHER: \"986800214365870921F3\"").empty());
 }
 
 void test_slow_operator()
@@ -118,7 +128,7 @@ void test_slow_operator()
     replies.back().body = "+COPS: 0\r\nOK";
     reply_index = 0;
     assert(query_operator_from_modem().empty());
-    assert(logs.back().find("响应无运营商名称") != std::string::npos);
+    assert(logs.back().find("mode=0 format=-1") != std::string::npos);
 }
 
 void test_refresh_queue()
@@ -159,6 +169,12 @@ int main()
 {
     test_slow_iccid_and_fallbacks();
     test_slow_operator();
+    logs.clear();
+    log_identity_response_shape("MCCID", "+MCCID: 898602F61324F5013007\r\nOK", "+MCCID:");
+    assert(logs.back().find("hex=2") != std::string::npos);
+    assert(logs.back().find("898602") == std::string::npos);
+    log_identity_response_shape("MCCID", "\r\nOK\r\n", "+MCCID:");
+    assert(logs.back().find("target=0") != std::string::npos);
     test_refresh_queue();
     std::cout << "modem refresh regression tests passed\n";
 }

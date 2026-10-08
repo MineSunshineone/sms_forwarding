@@ -734,22 +734,26 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
         // 通知调用方实际提交边界，早于 +CMGS 应答，且不把等待提示符算作已发送。
         if (on_submit) on_submit();
         TickDeadline deadline(timeout_ms);
+        TickDeadline final_deadline(1000);
+        bool submitted = false;
         scan.clear();
-        while (!deadline.expired()) {
+        while (submitted ? !final_deadline.expired() : !deadline.expired()) {
             int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(120));
             if (got > 0) {
                 preserve_uart_urcs(buf, static_cast<size_t>(got));
                 append_capped(response, buf, static_cast<size_t>(got), MAX_RESPONSE);
                 scan.append(reinterpret_cast<const char*>(buf), got);
-                // 官方手册定义 +CMGS:<mr> 即网络已接受 SMS-SUBMIT；某些固件的尾随 OK
-                // 可能没有完整 CRLF，不能因此把已经发送成功的短信等到超时。
-                if (has_cmgs_result(response) || has_cmgs_result(scan)) {
+                // +CMGS 已确认提交，但仍需在持锁期间收完最终结果码。
+                // 否则分块/延迟到达的 OK 会被下一条身份查询误认为自己的成功响应。
+                // 缺少尾随 OK 最多额外等 1 秒，保留提交成功，避免重发或长期占用通道。
+                if (!submitted && (has_cmgs_result(response) || has_cmgs_result(scan))) {
+                    submitted = true;
+                    final_deadline.restart(1000);
                     ret = ESP_OK;
-                    break;
                 }
                 int final_code = at_final_result(scan);
                 if (final_code != 0) {
-                    ret = final_code > 0 ? ESP_OK : ESP_FAIL;
+                    ret = submitted || final_code > 0 ? ESP_OK : ESP_FAIL;
                     break;
                 }
                 if (scan.size() > 64) scan.erase(0, scan.size() - 64);
@@ -782,27 +786,89 @@ static std::string query_imei_from_modem(void)
     return {};
 }
 
+// 只从 ICCID 响应行或完整裸卡号读取，不能把夹杂的短信 PDU/IMSI 数字段当成凭据主键。
 static std::string parse_iccid_response(const std::string& raw)
 {
-    std::string line = first_payload_line(raw);
-    size_t p = line.find(':');
-    std::string value = idf_util_trim_copy(p == std::string::npos ? line : line.substr(p + 1));
-    value.erase(std::remove(value.begin(), value.end(), '"'), value.end());
-    for (char& ch : value) if (ch == 'f') ch = 'F';
-    if (!value.empty() && value.back() == 'F') value.pop_back();
-    if (is_iccid_text(value)) return value;
-    // 部分固件会在 ICCID 前后附加槽位或状态字段，退回提取响应中的连续数字。
-    return first_digit_run(raw, 15, 22);
+    size_t pos = 0;
+    bool skip_sms_payload = false;
+    while (pos < raw.size()) {
+        size_t end = raw.find_first_of("\r\n", pos);
+        if (end == std::string::npos) end = raw.size();
+        std::string line = idf_util_trim_copy(raw.substr(pos, end - pos));
+        pos = end + 1;
+        if (line.empty()) continue;
+        if (skip_sms_payload) { skip_sms_payload = false; continue; }
+        if (line.rfind("+CMT:", 0) == 0 || line.rfind("+CDS:", 0) == 0 ||
+            line.rfind("+CBM:", 0) == 0) {
+            skip_sms_payload = true;
+            continue;
+        }
+        bool tagged = line.rfind("+MCCID:", 0) == 0 || line.rfind("+ICCID:", 0) == 0 ||
+                      line.rfind("+CCID:", 0) == 0;
+        if (tagged) line = line.substr(line.find(':') + 1);
+        // 带槽位/状态的响应按完整逗号字段验证；不截取不合法卡号的数字子串。
+        size_t field = 0;
+        do {
+            size_t comma = tagged ? line.find(',', field) : std::string::npos;
+            std::string value = idf_util_trim_copy(line.substr(field, comma == std::string::npos ? comma : comma - field));
+            if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+                value = value.substr(1, value.size() - 2);
+            }
+            if (is_iccid_text(value)) {
+                if (value.back() == 'F' || value.back() == 'f') value.pop_back();
+                if (is_iccid_text(value)) return value;
+            }
+            if (comma == std::string::npos) break;
+            field = comma + 1;
+        } while (field < line.size());
+    }
+    return {};
+}
+
+// 失败时只记响应形状，不输出卡号、短信正文或任何原始响应片段。
+// 区分只有 OK、缺少目标行、非十进制字符和字段长度，便于真机反馈定位。
+static void log_identity_response_shape(const char* query, const std::string& raw, const char* token)
+{
+    size_t marker = raw.find(token);
+    std::string payload;
+    if (marker != std::string::npos) {
+        size_t end = raw.find_first_of("\r\n", marker);
+        payload = raw.substr(marker + strlen(token), end == std::string::npos ? end : end - marker - strlen(token));
+    }
+    size_t digits = 0, hex_letters = 0, other = 0, commas = 0, quotes = 0;
+    for (unsigned char ch : payload) {
+        if (isdigit(ch)) ++digits;
+        else if ((ch >= 'A' && ch <= 'F') || (ch >= 'a' && ch <= 'f')) ++hex_letters;
+        else if (ch == ',') ++commas;
+        else if (ch == '"') ++quotes;
+        else if (!isspace(ch)) ++other;
+    }
+    idf_logf("身份响应诊断 %s: bytes=%u target=%u len=%u digits=%u hex=%u other=%u commas=%u quotes=%u",
+             query, static_cast<unsigned>(raw.size()), marker != std::string::npos ? 1U : 0U,
+             static_cast<unsigned>(payload.size()), static_cast<unsigned>(digits),
+             static_cast<unsigned>(hex_letters), static_cast<unsigned>(other),
+             static_cast<unsigned>(commas), static_cast<unsigned>(quotes));
+    if (marker != std::string::npos && strcmp(token, "+CRSM:") == 0) {
+        int sw1 = -1, sw2 = -1;
+        int count = sscanf(payload.c_str(), " %d , %d", &sw1, &sw2);
+        idf_logf("EF_ICCID 状态诊断: fields=%d sw1=%d sw2=%d", count, sw1, sw2);
+    } else if (marker != std::string::npos && strcmp(token, "+COPS:") == 0) {
+        int mode = -1, format = -1;
+        int count = sscanf(payload.c_str(), " %d , %d", &mode, &format);
+        idf_logf("COPS 状态诊断: fields=%d mode=%d format=%d", count, mode, format);
+    }
 }
 static std::string parse_iccid_crsm_response(const std::string& raw)
 {
     size_t marker = raw.find("+CRSM:");
     if (marker == std::string::npos) return {};
+    std::string line = line_containing(raw, marker);
     long sw1 = 0;
     long sw2 = 0;
-    if (sscanf(raw.c_str() + marker, "+CRSM: %ld,%ld", &sw1, &sw2) != 2 ||
-        (sw1 != 144 && sw1 != 145) || sw2 != 0) return {};
-    std::string encoded = first_quoted(raw, marker);
+    // ETSI TS 102 221 10.2.1.1：91 XX 同样表示成功，XX 是待取的主动命令长度。
+    if (sscanf(line.c_str(), "+CRSM: %ld , %ld", &sw1, &sw2) != 2 ||
+        !((sw1 == 144 && sw2 == 0) || (sw1 == 145 && sw2 >= 0 && sw2 <= 255))) return {};
+    std::string encoded = first_quoted(line);
     if (encoded.size() != 20) return {};
 
     std::string value;
@@ -830,12 +896,17 @@ static std::string query_current_iccid(void)
         idf_logf("ICCID 查询 %s: %s", command,
                  err != ESP_OK ? esp_err_to_name(err) : (iccid.empty() ? "响应无有效卡号" : "已读取"));
         if (!iccid.empty()) return iccid;
+        if (err == ESP_OK) {
+            std::string token = std::string(command + 2) + ":";
+            log_identity_response_shape(command, response, token.c_str());
+        }
     }
     // EF_ICCID 可在部分 PIN 锁卡或厂商 ICCID 命令不可用时通过标准受限 SIM 访问读取。
     esp_err_t err = idf_modem_send_at("AT+CRSM=176,12258,0,0,10", IDF_MODEM_IDENTITY_TIMEOUT_MS, response);
     std::string iccid = err == ESP_OK ? parse_iccid_crsm_response(response) : std::string();
     idf_logf("ICCID 查询 EF_ICCID: %s",
              err != ESP_OK ? esp_err_to_name(err) : (iccid.empty() ? "响应无有效卡号" : "已读取"));
+    if (err == ESP_OK && iccid.empty()) log_identity_response_shape("EF_ICCID", response, "+CRSM:");
     return iccid;
 }
 
@@ -1032,6 +1103,7 @@ static std::string query_operator_from_modem(void)
     std::string name = err == ESP_OK ? parse_cops(response) : std::string();
     idf_logf("运营商查询 AT+COPS?: %s",
              err != ESP_OK ? esp_err_to_name(err) : (name.empty() ? "响应无运营商名称" : "已读取"));
+    if (err == ESP_OK && name.empty()) log_identity_response_shape("COPS", response, "+COPS:");
     return name;
 }
 
@@ -1189,12 +1261,16 @@ static bool parse_http_url(const std::string& raw_url, std::string& protocol,
     return true;
 }
 
-static void normalize_keepalive_payload_size(const std::string& host, std::string& path)
+static void normalize_keepalive_payload_size(std::string& protocol, const std::string& host,
+                                             std::string& path)
 {
     if (host != "gg.incrafttime.top") return;
-    if (!starts_with(path, "/api/payload?")) return;
-    size_t pos = path.find("size=128684");
-    if (pos != std::string::npos) path.replace(pos, strlen("size=128684"), "size=64342");
+    if (path == "/" || path == "/api/payload?size=128684" ||
+        path == "/api/payload?size=64342") {
+        // 内置站点 HTTP 已重定向到 HTTPS；首页是 HTML，不能用于下载保号。
+        protocol = "https";
+        path = "/api/payload?size=64342";
+    }
 }
 
 static void append_no_cache_query(std::string& path)
@@ -1283,6 +1359,24 @@ static int parse_mhttp_create_id(const std::string& resp)
     return static_cast<int>(id);
 }
 
+// ML307 MHTTP 错误码；PDP 有地址不代表 DNS 或目标服务器可达。
+static const char* mhttp_error_detail(int code)
+{
+    switch (code) {
+    case 1: return "域名解析失败，请检查域名及蜂窝 APN/DNS";
+    case 2: return "连接服务器失败";
+    case 3: return "连接服务器超时";
+    case 4: return "SSL握手失败";
+    case 5: return "连接异常断开";
+    case 6: return "请求响应超时";
+    case 7: return "接收数据解析失败";
+    case 8: return "缓存空间不足";
+    case 9: return "数据丢包";
+    case 10: return "文件写入失败";
+    default: return "未知错误";
+    }
+}
+
 static void parse_mhttp_head(const std::string& head, int http_id, IdfCellularHttpResult& result,
                              bool& complete, bool& error)
 {
@@ -1311,8 +1405,9 @@ static void parse_mhttp_head(const std::string& head, int http_id, IdfCellularHt
         int n = 0;
         if (parse_comma_longs(head.substr(comma + 1), nums, 3, n) && n >= 2 && nums[0] == http_id) {
             result.mhttpError = static_cast<int>(nums[1]);
-            idf_logf("蜂窝HTTP错误码: %d%s", result.mhttpError,
-                     result.mhttpError == 4 ? "(SSL握手失败)" : "");
+            result.message = "蜂窝HTTP错误码 " + std::to_string(result.mhttpError) +
+                             "：" + mhttp_error_detail(result.mhttpError);
+            idf_log_line(result.message.c_str());
             error = true;
             complete = true;
         }
@@ -1340,27 +1435,32 @@ static bool send_mhttp_header_locked(int http_id, bool more, const std::string& 
     return send_at_locked(cmd, 3000, resp) == ESP_OK;
 }
 
-static void append_sms_urc_line(const std::string& line)
-{
-    std::string text = line;
-    text += "\r\n";
-    append_urc_text(text);
-}
-
 static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, uint32_t min_bytes,
-                                       IdfCellularHttpResult& result)
+                                       IdfCellularHttpResult& result,
+                                       const std::string& initial_response)
 {
     TickDeadline deadline(timeout_ms);
     std::string head;
     head.reserve(280);
     bool skipping_data = false;
-    bool append_next_sms_payload = false;
     bool complete = false;
     bool error = false;
     uint8_t buf[128];
+    size_t initial_pos = 0;
 
     while (!deadline.expired() && !complete) {
-        int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(120));
+        // 请求的 OK 与首个 HTTP URC 可能同包到达，先消费命令阶段已读的字节。
+        bool from_initial = initial_pos < initial_response.size();
+        int got;
+        if (from_initial) {
+            got = static_cast<int>(std::min(sizeof(buf), initial_response.size() - initial_pos));
+            memcpy(buf, initial_response.data() + initial_pos, static_cast<size_t>(got));
+            initial_pos += static_cast<size_t>(got);
+        } else {
+            got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(120));
+            // 与命令接收阶段共用跨包状态，避免短信头/PDU 跨阶段时丢失或重复。
+            if (got > 0) preserve_uart_urcs(buf, static_cast<size_t>(got));
+        }
         if (got <= 0) continue;
         for (int i = 0; i < got && !complete; ++i) {
             char ch = static_cast<char>(buf[i]);
@@ -1376,12 +1476,6 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, uint32_
                 if (!line.empty()) {
                     if (starts_with(line, "+MHTTPURC: \"err\"")) {
                         parse_mhttp_head(line, http_id, result, complete, error);
-                    } else if (append_next_sms_payload || starts_with(line, "+CMT:") || starts_with(line, "+CMTI:")) {
-                        append_sms_urc_line(line);
-                        append_next_sms_payload = starts_with(line, "+CMT:");
-                    } else if (line == "RING" || starts_with(line, "+CLIP:")) {
-                        // 蜂窝请求最长可占用 UART ~90s，期间仍须保留短信与来电 URC。
-                        append_sms_urc_line(line);
                     }
                 }
                 head.clear();
@@ -1400,7 +1494,15 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, uint32_
         }
     }
 
-    if (!complete) idf_log_line("蜂窝HTTP响应等待超时");
+    if (!complete) {
+        result.message = "蜂窝HTTP响应等待超时";
+        idf_log_line(result.message.c_str());
+    } else if (!error && (result.httpStatus < 200 || result.httpStatus >= 400)) {
+        result.message = "蜂窝HTTP状态异常：" + std::to_string(result.httpStatus);
+    } else if (!error && result.bytesRead < min_bytes) {
+        result.message = "蜂窝HTTP下载量不足：" + std::to_string(result.bytesRead) +
+                         "/" + std::to_string(min_bytes) + " 字节";
+    }
     return !error && complete && result.httpStatus >= 200 && result.httpStatus < 400 &&
            result.bytesRead >= min_bytes;
 }
@@ -1750,7 +1852,8 @@ static bool fetch_mhttp_once_locked(const std::string& protocol, const std::stri
     send_at_locked(cmd, 3000, resp);
     std::string request_cmd = "AT+MHTTPREQUEST=" + std::to_string(http_id) + "," +
                               std::to_string(method_value) + ",0," + hex_encode_ascii(path);
-    if (send_at_locked(request_cmd, 10000, resp) != ESP_OK) {
+    // 不额外排空下载数据；同包 URC 交给下载解析器，避免丢失快速错误/响应。
+    if (send_at_locked(request_cmd, 10000, resp, 1400, 0) != ESP_OK) {
         result.message = "蜂窝HTTP请求发送失败";
         snprintf(cmd, sizeof(cmd), "AT+MHTTPDEL=%d", http_id);
         send_at_locked(cmd, 2000, resp, 256, 20);
@@ -1758,12 +1861,31 @@ static bool fetch_mhttp_once_locked(const std::string& protocol, const std::stri
     }
 
     bool ok = wait_mhttp_download_locked(http_id, CELLULAR_HTTP_TIMEOUT_MS,
-                                         min_response_bytes, result);
+                                         min_response_bytes, result, resp);
     snprintf(cmd, sizeof(cmd), "AT+MHTTPDEL=%d", http_id);
     send_at_locked(cmd, 3000, resp, 256, 20);
     result.ok = ok;
     if (result.message.empty()) result.message = ok ? "蜂窝HTTP请求完成" : "蜂窝HTTP请求失败";
     return ok;
+}
+
+// 保号只临时激活 PDP，不写入持久配置；关闭失败必须让调用方看见。
+static bool restore_cellular_data_locked(bool data_enabled, IdfCellularHttpResult& result)
+{
+    if (data_enabled) return true;
+    std::string resp;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (send_at_locked("AT+CGACT=0,1", 5000, resp) == ESP_OK) {
+            set_status_cell_ip("");
+            idf_log_line("保号结束，已恢复蜂窝数据关闭状态");
+            return true;
+        }
+    }
+    if (!result.message.empty()) result.message += "；";
+    result.message += "恢复蜂窝数据关闭状态失败，请检查模组，数据可能仍开启";
+    result.ok = false;
+    idf_log_line("恢复蜂窝数据关闭状态失败，数据可能仍开启");
+    return false;
 }
 
 static esp_err_t cellular_http_request_impl(const std::string& url, const char* method,
@@ -1793,7 +1915,7 @@ static esp_err_t cellular_http_request_impl(const std::string& url, const char* 
     std::string path;
     if (!parse_http_url(url, protocol, host, path, result.message)) return ESP_ERR_INVALID_ARG;
     if (keepalive) {
-        normalize_keepalive_payload_size(host, path);
+        normalize_keepalive_payload_size(protocol, host, path);
         append_no_cache_query(path);
     }
 
@@ -1817,9 +1939,9 @@ static esp_err_t cellular_http_request_impl(const std::string& url, const char* 
     std::string ip;
     if (!wait_pdp_ready_locked(CELLULAR_PDP_READY_TIMEOUT_MS, ip)) {
         set_status_cell_ip("");
-        if (!config.dataEnabled) send_at_locked("AT+CGACT=0,1", 5000, resp);
-        xSemaphoreGiveRecursive(s_at_mutex);
         result.message = "蜂窝PDP未取得有效IP，请查看日志";
+        restore_cellular_data_locked(config.dataEnabled, result);
+        xSemaphoreGiveRecursive(s_at_mutex);
         return ESP_FAIL;
     }
     result.cellIp = ip;
@@ -1835,10 +1957,7 @@ static esp_err_t cellular_http_request_impl(const std::string& url, const char* 
         result = retry;
     }
 
-    if (!config.dataEnabled) {
-        send_at_locked("AT+CGACT=0,1", 5000, resp);
-        set_status_cell_ip("");
-    }
+    if (!restore_cellular_data_locked(config.dataEnabled, result)) ok = false;
     result.ok = ok;
     xSemaphoreGiveRecursive(s_at_mutex);
     return ok ? ESP_OK : ESP_FAIL;

@@ -15,9 +15,9 @@ def function(name):
 
 
 functions = '\n\n'.join(function(name) for name in [
-    'line_containing(', 'line_is_payload(', 'first_payload_line(', 'first_digit_run(', 'is_iccid_text(',
+    'line_containing(', 'is_iccid_text(',
     'first_quoted(', 'parse_iccid_response(', 'parse_iccid_crsm_response(',
-    'query_current_iccid(', 'parse_cops(', 'query_operator_from_modem(',
+    'log_identity_response_shape(', 'query_current_iccid(', 'parse_cops(', 'query_operator_from_modem(',
 ])
 start = source.index('        bool force_sample =')
 end = source.index('        // 正常态', start)
