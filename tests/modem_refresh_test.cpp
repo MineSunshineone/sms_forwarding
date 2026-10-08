@@ -12,8 +12,22 @@
 
 using esp_err_t = int;
 using TickType_t = uint32_t;
-constexpr int ESP_OK = 0, ESP_ERR_TIMEOUT = 1, ESP_FAIL = 2;
+constexpr int ESP_OK = 0, ESP_ERR_TIMEOUT = 1, ESP_FAIL = 2, ESP_ERR_INVALID_STATE = 3;
 #define pdMS_TO_TICKS(ms) (ms)
+int lock_depth = 0;
+bool lock_available = true, s_started = true;
+void* s_at_mutex = reinterpret_cast<void*>(1);
+constexpr int pdTRUE = 1;
+int64_t fake_time = 100000000;
+uint32_t transport_overhead_ms = 0;
+int64_t esp_timer_get_time() { return fake_time; }
+int xSemaphoreTakeRecursive(void*, uint32_t timeout) {
+    assert(timeout == 100);
+    fake_time += 1000 * timeout;
+    if (!lock_available) return 0;
+    ++lock_depth; return pdTRUE;
+}
+void xSemaphoreGiveRecursive(void*) { assert(lock_depth == 1); --lock_depth; }
 struct Reply { std::string command; uint32_t latency; int error; std::string body; };
 std::vector<Reply> replies;
 std::vector<std::string> logs;
@@ -35,11 +49,13 @@ void idf_logf(const char* format, ...)
     logs.emplace_back(buf);
 }
 void idf_log_line(const char* text) { logs.emplace_back(text); }
-esp_err_t idf_modem_send_at(const char* command, uint32_t timeout, std::string& response)
+esp_err_t idf_modem_send_at(const std::string& command, uint32_t timeout, std::string& response)
 {
+    if (command.find("AT+COPS") == 0) assert(lock_depth == 1);
     assert(reply_index < replies.size());
     const Reply& reply = replies[reply_index++];
     assert(command == reply.command);
+    fake_time += 1000 * (std::min(reply.latency, timeout) + transport_overhead_ms);
     response = reply.latency <= timeout ? reply.body : std::string();
     return reply.latency <= timeout ? reply.error : ESP_ERR_TIMEOUT;
 }
@@ -58,7 +74,6 @@ uint32_t modem_retry_delay_ms(uint8_t) { return 30000; }
 IdfModemStatus status;
 bool idle = true, inject_request = false, last_log_summary = false, last_network = false;
 int sampled = 0;
-int64_t esp_timer_get_time() { return 100000000; }
 IdfModemStatus idf_modem_get_status() { return status; }
 IdfSimSettingsView idf_config_get_sim_settings_view() { return {}; }
 bool startup_info_complete() { return false; }
@@ -148,16 +163,81 @@ void test_slow_iccid_and_fallbacks()
     assert(parse_iccid_crsm_response("+CRSM: 144,0\r\n+OTHER: \"986800214365870921F3\"").empty());
 }
 
+bool manual_operator(std::string& message)
+{
+    bool success = false;
+    // @手动运营商查询@
+    return success;
+}
+
 void test_slow_operator()
 {
-    replies = {{"AT+COPS=3,0", 2000, ESP_OK, "OK"},
-               {"AT+COPS?", 3200, ESP_OK, "+CEREG: 1\r\n+COPS: 0,0,\"CMCC\",7\r\nOK"}};
+    auto run = [](std::vector<Reply> script, const std::string& expected, bool ok) {
+        replies = script; reply_index = 0; logs.clear();
+        int64_t started = fake_time;
+        std::string name = "stale";
+        esp_err_t err = idf_modem_get_operator(name);
+        assert((err == ESP_OK) == ok);
+        assert(name == expected);
+        assert(reply_index == replies.size());
+        assert(lock_depth == 0 && fake_time - started <= 20000000);
+    };
+    for (const std::string body : {"+COPS: 0,0,\"CMCC\",7", "+CEREG: 1\r\n +COPS: 4,1,\"CMCC\",7,0\r\nOK"})
+        run({{"AT+COPS?", 3200, ESP_OK, body}}, "CMCC", true);
+    for (const std::string plmn : {"46000", "001001"})
+        run({{"AT+COPS?", 1, ESP_OK, "+COPS: 1,2,\"" + plmn + "\",7"}}, "PLMN " + plmn, true);
+    transport_overhead_ms = 1100;
+    for (int original : {0, 1}) {
+        std::vector<Reply> script = {
+            {"AT+COPS?", 3200, ESP_OK, "+COPS: 0," + std::to_string(original) + ",\"\",7"},
+            {"AT+COPS=3,2", 2000, ESP_OK, "OK"},
+            {"AT+COPS?", 3200, ESP_OK, "+CEREG: 5\r\n+COPS: 0,2,\"46000\",7"},
+            {"AT+COPS=3," + std::to_string(original), 100, ESP_OK, "OK"}};
+        run(script, "PLMN 46000", true);
+        for (int error : {ESP_FAIL, ESP_ERR_TIMEOUT}) {
+            auto changed = script; changed[1].error = error; changed.erase(changed.begin() + 2);
+            run(changed, "", false);
+            changed = script; changed[2].error = error; run(changed, "", false);
+            changed = script; changed[3].error = error; run(changed, "", false);
+            assert(logs.back().find("恢复失败") != std::string::npos);
+        }
+        for (const std::string bad : {"+COPS: 0,2,\"\",7", "+COPS: 0,2,\"4600\",7", "+COPS: 0,2,\"4600000\",7", "+COPS: 0,2,\"46A00\",7", "+COPS: 0,2,\" 46000 \",7", "+COPS: 0,0,\"46000\",7", "+COPS: 0,2,\"46000", "+COPS: 0,2,\"46000\",7,junk"}) {
+            auto changed = script; changed[2].body = bad; run(changed, "", false);
+        }
+        auto slow = script; for (auto& reply : slow) reply.latency = 5000;
+        // 工作预算耗尽时不再读数字响应，但仍保留完整恢复预算。
+        slow.erase(slow.begin() + 2);
+        run(slow, "", false);
+        slow = script; slow[1].latency = 6000; slow.erase(slow.begin() + 2);
+        run(slow, "", false);
+        slow = script; slow[2].latency = 6000; run(slow, "", false);
+    }
+    for (const std::string bad : {"+COPS: 0", "+COPS: 0,9,\"\",7", "+COPS: 3,0,\"\",7", "+COPS: ,0,\"\",7", "+COPS: 0, ,\"\",7", "junk+COPS: 0,0,\"CMCC\",7", "+OTHER: \"CMCC\"", "+COPS: 0,0,\"CMCC\",7junk", "+COPS: 0,0,\"CMCC\",7\r\n+COPS: 0,0,\"OTHER\",7", "+COPS: 0,2,\"460A0\",7"})
+        run({{"AT+COPS?", 1, ESP_OK, bad}}, "", false);
+    for (int error : {ESP_FAIL, ESP_ERR_TIMEOUT}) run({{"AT+COPS?", 1, error, ""}}, "", false);
+    transport_overhead_ms = 0;
+    lock_available = false; run({}, "", false); lock_available = true;
+    s_started = false; run({}, "", false); s_started = true;
+    s_at_mutex = nullptr; run({}, "", false); s_at_mutex = reinterpret_cast<void*>(1);
+    run({{"AT+COPS?", 1, ESP_OK, "+COPS: 0,2,\" 46000 \",7"}}, "", false);
+    replies = {{"AT+COPS?", 3200, ESP_OK, "+COPS: 0,0,\"CMCC\",7"}};
     reply_index = 0;
     assert(query_operator_from_modem() == "CMCC");
-    replies.back().body = "+COPS: 0\r\nOK";
     reply_index = 0;
-    assert(query_operator_from_modem().empty());
-    assert(logs.back().find("mode=0 format=-1") != std::string::npos);
+    std::string message;
+    assert(manual_operator(message) && message == "CMCC");
+    replies = {{"AT+COPS?", 1, ESP_OK, "+COPS: 0"}};
+    reply_index = 0;
+    assert(!manual_operator(message) && message.find("无法读取") != std::string::npos);
+    replies = {{"AT+COPS?", 1, ESP_OK, "+COPS: 0,0,\"\",7"},
+               {"AT+COPS=3,2", 1, ESP_OK, "OK"},
+               {"AT+COPS?", 1, ESP_OK, "+COPS: 0,2,\"\",7"},
+               {"AT+COPS=3,0", 1, ESP_OK, "OK"}};
+    reply_index = 0;
+    assert(!manual_operator(message) && reply_index == 4 && lock_depth == 0);
+    replies[2].body = "+COPS: 0,2,\"46000\",7";
+    reply_index = 0;
+    assert(manual_operator(message) && message == "PLMN 46000" && reply_index == 4 && lock_depth == 0);
 }
 
 void test_refresh_queue()

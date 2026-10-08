@@ -1062,19 +1062,9 @@ static esp_err_t handle_modem_control(httpd_req_t* req)
             message = resp.empty() ? esp_err_to_name(err) : resp;
         }
     } else if (action == "operator") {
-        std::string resp;
-        // 先选长名称格式，否则自动模式下 COPS? 只回模式位(+COPS: 0)，读不到运营商名
-        idf_modem_send_at("AT+COPS=3,0", 3000, resp);
-        esp_err_t err = idf_modem_send_at("AT+COPS?", 5000, resp);
-        std::string line = first_line_containing(resp, "+COPS:");
-        if (err == ESP_OK && !line.empty()) {
-            size_t q1 = line.find('"');
-            size_t q2 = q1 == std::string::npos ? std::string::npos : line.find('"', q1 + 1);
-            message = (q1 != std::string::npos && q2 != std::string::npos) ? line.substr(q1 + 1, q2 - q1 - 1) : line;
-            success = true;
-        } else {
-            message = resp.empty() ? esp_err_to_name(err) : resp;
-        }
+        esp_err_t err = idf_modem_get_operator(message);
+        success = err == ESP_OK && !message.empty();
+        if (!success) message = std::string("无法读取当前驻网运营商: ") + esp_err_to_name(err);
     } else if (action == "imei") {
         std::string imei;
         esp_err_t err = idf_modem_get_imei(imei);

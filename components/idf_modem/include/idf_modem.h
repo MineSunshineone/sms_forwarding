@@ -73,6 +73,8 @@ void idf_modem_signal_event(void);
 IdfModemStatus idf_modem_get_status(void);
 // 获取合法数字 IMEI；优先使用缓存，缓存缺失时通过模组标准 IMEI 命令补采。
 esp_err_t idf_modem_get_imei(std::string& imei);
+// 原子查询当前驻网运营商；名称不可用时返回显式 PLMN，恢复原查询格式后才报告成功。
+esp_err_t idf_modem_get_operator(std::string& name);
 // AT 通道当前是否空闲（Web 路由用于"模组正忙"快速返回，避免长时间阻塞 httpd 任务）
 bool idf_modem_at_idle(void);
 // 用户显式请求刷新概览模组信息时，短时间打开展示型身份/信号采样窗口。
