@@ -1065,29 +1065,131 @@ static bool parse_cereg(const std::string& resp, int& stat)
     return true;
 }
 
-// 注意：都要解析"包含 token 的那一行"。CEREG=2 的 URC 可能与查询响应混在同一段，
-// 取"第一有效行"会把 +CEREG 行错当成 +COPS/+CGDCONT/+CNUM 的内容。
-static std::string parse_cops(const std::string& resp)
+// 只接受独立的 COPS 查询行；空名称合法，格式未知时绝不猜测或改写模组状态。
+static bool parse_cops(const std::string& resp, int& format, std::string& oper)
 {
-    size_t p = resp.find("+COPS:");
-    if (p == std::string::npos) return {};
-    std::string line = line_containing(resp, p);
-    // 自动模式下若未先选名称格式，AT+COPS? 只回 "+COPS: 0"(无引号运营商名)。
-    // 此时返回空让上层改用 COPS=3,0 重试，而不是把模式位当运营商缓存下来。
-    return first_quoted(line);
+    format = -1;
+    oper.clear();
+    std::string line;
+    for (size_t pos = 0; pos < resp.size();) {
+        size_t end = resp.find('\n', pos);
+        if (end == std::string::npos) end = resp.size();
+        std::string candidate = idf_util_trim_copy(resp.substr(pos, end - pos));
+        if (candidate.compare(0, 6, "+COPS:") == 0) {
+            if (!line.empty()) return false;
+            line = candidate;
+        }
+        pos = end + 1;
+    }
+    if (line.empty()) return false;
+    size_t pos = 6;
+    auto spaces = [&]() { while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos; };
+    auto number = [&](int& value) {
+        spaces();
+        size_t start = pos;
+        value = 0;
+        while (pos < line.size() && line[pos] >= '0' && line[pos] <= '9') {
+            if (value > 1000) return false;
+            value = value * 10 + line[pos++] - '0';
+        }
+        bool found = pos > start;
+        spaces();
+        return found;
+    };
+    auto comma = [&]() { spaces(); return pos < line.size() && line[pos++] == ','; };
+    int mode = -1, parsed_format = -1;
+    if (!number(mode) || !(mode == 0 || mode == 1 || mode == 2 || mode == 4)) return false;
+    if (pos == line.size()) return true;
+    if (!comma() || !number(parsed_format) || parsed_format > 2 || !comma()) return false;
+    spaces();
+    if (pos == line.size() || line[pos++] != '"') return false;
+    size_t begin = pos, end = line.find('"', pos);
+    if (end == std::string::npos) return false;
+    std::string value = line.substr(begin, end - begin);
+    for (unsigned char ch : value) if (ch < 0x20 || ch == 0x7f) return false;
+    pos = end + 1;
+    spaces();
+    for (int field = 0; pos < line.size() && field < 2; ++field) {
+        int ignored = 0;
+        if (!comma() || !number(ignored)) return false;
+    }
+    if (pos != line.size()) return false;
+    format = parsed_format;
+    oper = parsed_format == 2 ? value : idf_util_trim_copy(value);
+    return true;
+}
+
+static std::string cops_display(int format, const std::string& oper)
+{
+    if (format == 0 || format == 1) return oper;
+    if (format != 2 || (oper.size() != 5 && oper.size() != 6)) return {};
+    for (char ch : oper) if (ch < '0' || ch > '9') return {};
+    // 当前驻网 PLMN，不能用 IMSI 的归属运营商冒充漫游时的服务网络。
+    return "PLMN " + oper;
+}
+
+esp_err_t idf_modem_get_operator(std::string& name)
+{
+    name.clear();
+    if (!s_started || !s_at_mutex) return ESP_ERR_INVALID_STATE;
+    // 查询是低优先级展示工作；整组命令独占递归锁，避免终端/采样改写查询格式。
+    // 总预算 20 秒，为恢复预留 6.5 秒；每条命令额外预留 1.2 秒用于
+    // UART 捕获(最长约 1 秒)及响应读轮询，避免收尾超过整个查询预算。
+    const int64_t deadline = esp_timer_get_time() + 20000000;
+    if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    std::string response;
+    auto send = [&](const std::string& cmd, bool restoring = false) -> esp_err_t {
+        int64_t remaining = (deadline - esp_timer_get_time()) / 1000 - 1200;
+        if (!restoring) remaining -= 6500;
+        if (remaining <= 0) return ESP_ERR_TIMEOUT;
+        return idf_modem_send_at(cmd, static_cast<uint32_t>(std::min<int64_t>(5000, remaining)), response);
+    };
+    int original_format = -1;
+    std::string oper;
+    esp_err_t err = send("AT+COPS?");
+    bool changed = false;
+    if (err == ESP_OK) {
+        if (!parse_cops(response, original_format, oper) || original_format < 0) {
+            log_identity_response_shape("COPS", response, "+COPS:");
+            err = ESP_FAIL;
+        } else {
+            name = cops_display(original_format, oper);
+            if (name.empty() && original_format != 2) {
+                // 中移 AT 手册 V1.8.1 §5.2：mode=3 仅改查询格式，不触发注册/注销。
+                // 超时也可能已执行设置，因此从尝试设置起就必须恢复。
+                changed = true;
+                err = send("AT+COPS=3,2");
+                if (err == ESP_OK) {
+                    err = send("AT+COPS?");
+                    int numeric_format = -1;
+                    if (err == ESP_OK && parse_cops(response, numeric_format, oper) && numeric_format == 2)
+                        name = cops_display(numeric_format, oper);
+                }
+            }
+            if (err == ESP_OK && name.empty()) {
+                log_identity_response_shape("COPS", response, "+COPS:");
+                err = ESP_FAIL;
+            }
+        }
+    }
+    if (changed) {
+        esp_err_t restore_err = send("AT+COPS=3," + std::to_string(original_format), true);
+        if (restore_err != ESP_OK) {
+            idf_logf("运营商查询格式恢复失败: %s", esp_err_to_name(restore_err));
+            name.clear();
+            err = restore_err;
+        }
+    }
+    xSemaphoreGiveRecursive(s_at_mutex);
+    if (err != ESP_OK) name.clear();
+    return err;
 }
 
 static std::string query_operator_from_modem(void)
 {
-    std::string response;
-    // 只选择查询返回格式，不切换网络或注册模式；与网页手动查询使用相同等待时间。
-    esp_err_t format_err = idf_modem_send_at("AT+COPS=3,0", IDF_MODEM_IDENTITY_TIMEOUT_MS, response);
-    if (format_err != ESP_OK) idf_logf("运营商名称格式设置: %s", esp_err_to_name(format_err));
-    esp_err_t err = idf_modem_send_at("AT+COPS?", IDF_MODEM_IDENTITY_TIMEOUT_MS, response);
-    std::string name = err == ESP_OK ? parse_cops(response) : std::string();
-    idf_logf("运营商查询 AT+COPS?: %s",
-             err != ESP_OK ? esp_err_to_name(err) : (name.empty() ? "响应无运营商名称" : "已读取"));
-    if (err == ESP_OK && name.empty()) log_identity_response_shape("COPS", response, "+COPS:");
+    std::string name;
+    esp_err_t err = idf_modem_get_operator(name);
+    idf_logf("运营商查询 AT+COPS?: %s", err == ESP_OK ? "已读取" : esp_err_to_name(err));
     return name;
 }
 
