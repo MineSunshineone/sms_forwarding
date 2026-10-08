@@ -8,6 +8,7 @@
 #include <cstring>
 #include <vector>
 #include "idf_modem_sampling.h"
+#include "idf_iccid.h"
 
 using esp_err_t = int;
 using TickType_t = uint32_t;
@@ -85,6 +86,34 @@ void run_sampling(bool sim_ready)
 
 void test_slow_iccid_and_fallbacks()
 {
+    assert(is_iccid_text("898600D6991330004146"));
+    const std::string hex_iccid = "898600D6991330004146";
+    assert(parse_iccid_response("+MCCID: 898600d6991330004146\r\nOK") == hex_iccid);
+    assert(parse_iccid_crsm_response("+CRSM: 144,0,\"9868006d993103001464\"") == hex_iccid);
+    for (const std::string& good : {hex_iccid, std::string("898600AF991330004146"),
+                                   std::string("8986001234567890123"), std::string("898600123456789012F")}) {
+        std::string padded = good.size() == 19 ? good + "F" : good;
+        std::string encoded = padded;
+        for (size_t i = 0; i < encoded.size(); i += 2) std::swap(encoded[i], encoded[i + 1]);
+        assert(parse_iccid_response("+ICCID: \"" + good + "\"\r\nOK") == good);
+        assert(parse_iccid_response("+CCID: " + padded + "\r\nOK") == good);
+        assert(parse_iccid_crsm_response("+CRSM: 144,0,\"" + encoded + "\"") == good);
+        assert(idf_normalize_iccid(idf_normalize_iccid(padded)) == good);
+    }
+    for (const std::string bad : {"89860D66991330004146", "988600D6991330004146",
+                                  "898600G6991330004146", "89860012345678901",
+                                  "898600123456789012345678", "898600D6991330004146!"}) {
+        assert(parse_iccid_response("+MCCID: " + bad + "\r\nOK").empty());
+        assert(idf_normalize_iccid(bad).empty());
+    }
+    assert(parse_iccid_crsm_response("+CRSM: 144,0,\"9868006G993103004164\"").empty());
+    assert(parse_iccid_crsm_response("+CRSM: 144,0,\"9868D06D993103004164\"").empty());
+    for (const std::string malformed : {
+            "+CRSM: 144,0x,\"9868006D993103001464\"",
+            "+CRSM: 144,0 \"9868006D993103001464\"",
+            "+CRSM: 144,0,\"9868006D993103001464\",extra",
+            "+CRSM: 144,0,\"9868006D993103001464!\""})
+        assert(parse_iccid_crsm_response(malformed).empty());
     const std::string iccid = "8986001234567890123";
     replies = {{"AT+MCCID", 2400, ESP_OK, "\r\n+MCCID: " + iccid + "\r\n\r\nOK\r\n"}};
     assert(query_current_iccid() == iccid);
@@ -110,9 +139,9 @@ void test_slow_iccid_and_fallbacks()
     assert(parse_iccid_response("+CMT: ,40\r\n0011223344556677889A\r\n+MCCID: invalid\r\nOK").empty());
     assert(parse_iccid_response("+CMT: ,10\r\n" + iccid + "\r\nOK").empty());
     assert(parse_iccid_response("+MCCID: X" + iccid + "Y\r\nOK").empty());
-    assert(parse_iccid_response("+MCCID: 898602F61324F5013007\r\nOK").empty());
+    assert(parse_iccid_response("+MCCID: 898602F61324F5013007\r\nOK") == "898602F61324F5013007");
     assert(parse_iccid_response(iccid + "\r\nOK") == iccid);
-    assert(parse_iccid_crsm_response("+CRSM: 144,0,\"986800214365870921FF\"").empty());
+    assert(parse_iccid_crsm_response("+CRSM: 144,0,\"986800214365870921FF\"") == "898600123456789012F");
     assert(parse_iccid_crsm_response("+CRSM: 145,27,\"986800214365870921F3\"") == iccid);
     assert(parse_iccid_crsm_response("+CRSM: 145,256,\"986800214365870921F3\"").empty());
     assert(parse_iccid_crsm_response("+CRSM: 144,1,\"986800214365870921F3\"").empty());

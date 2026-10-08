@@ -1,3 +1,4 @@
+#include "idf_iccid.h"
 #include "idf_modem.h"
 #include "idf_modem_sampling.h"
 
@@ -258,23 +259,7 @@ static std::string first_digit_run(const std::string& resp, size_t min_len, size
 
 static bool is_iccid_text(const std::string& value)
 {
-    if (value.size() < 15 || value.size() > 22) return false;
-    bool seen_digit = false;
-    bool padding = false;
-    uint8_t padding_count = 0;
-    for (char ch : value) {
-        if (isdigit(static_cast<unsigned char>(ch))) {
-            if (padding) return false;
-            seen_digit = true;
-        } else if (ch == 'F' || ch == 'f') {
-            if (!seen_digit) return false;
-            padding = true;
-            if (++padding_count > 1) return false;
-        } else {
-            return false;
-        }
-    }
-    return seen_digit;
+    return !idf_normalize_iccid(value).empty();
 }
 
 static bool is_imei_text(const std::string& value)
@@ -378,7 +363,7 @@ static void update_status(const IdfModemStatus& patch, bool identity = false, bo
     if (!patch.model.empty()) s_status.model = patch.model;
     if (!patch.fwver.empty()) s_status.fwver = patch.fwver;
     if (!patch.imei.empty() && is_imei_text(patch.imei)) s_status.imei = patch.imei;
-    if (!patch.iccid.empty() && is_iccid_text(patch.iccid)) s_status.iccid = patch.iccid;
+    if (!patch.iccid.empty() && is_iccid_text(patch.iccid)) s_status.iccid = idf_normalize_iccid(patch.iccid);
     if (!patch.imsi.empty() && is_imsi_text(patch.imsi)) s_status.imsi = patch.imsi;
     if (!patch.operatorName.empty()) s_status.operatorName = patch.operatorName;
     if (!patch.apnSim.empty()) s_status.apnSim = patch.apnSim;
@@ -449,7 +434,8 @@ static std::string read_nvs_string(nvs_handle_t nvs, const char* key, size_t max
 static void save_identity_cache(const std::string& imei, const std::string& iccid)
 {
     bool valid_imei = is_imei_text(imei);
-    bool valid_iccid = is_iccid_text(iccid);
+    const std::string canonical_iccid = idf_normalize_iccid(iccid);
+    bool valid_iccid = !canonical_iccid.empty();
     if (!valid_imei && !valid_iccid) return;
     nvs_handle_t nvs = 0;
     if (nvs_open("sms_config", NVS_READWRITE, &nvs) != ESP_OK) return;
@@ -461,8 +447,8 @@ static void save_identity_cache(const std::string& imei, const std::string& icci
         err = nvs_set_str(nvs, "modemImei", imei.c_str());
         changed = err == ESP_OK;
     }
-    if (err == ESP_OK && valid_iccid && iccid != old_iccid) {
-        err = nvs_set_str(nvs, "modemIccid", iccid.c_str());
+    if (err == ESP_OK && valid_iccid && canonical_iccid != old_iccid) {
+        err = nvs_set_str(nvs, "modemIccid", canonical_iccid.c_str());
         changed = changed || err == ESP_OK;
     }
     if (err == ESP_OK && changed) err = nvs_commit(nvs);
@@ -814,10 +800,8 @@ static std::string parse_iccid_response(const std::string& raw)
             if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
                 value = value.substr(1, value.size() - 2);
             }
-            if (is_iccid_text(value)) {
-                if (value.back() == 'F' || value.back() == 'f') value.pop_back();
-                if (is_iccid_text(value)) return value;
-            }
+            value = idf_normalize_iccid(value);
+            if (!value.empty()) return value;
             if (comma == std::string::npos) break;
             field = comma + 1;
         } while (field < line.size());
@@ -866,24 +850,24 @@ static std::string parse_iccid_crsm_response(const std::string& raw)
     long sw1 = 0;
     long sw2 = 0;
     // ETSI TS 102 221 10.2.1.1：91 XX 同样表示成功，XX 是待取的主动命令长度。
-    if (sscanf(line.c_str(), "+CRSM: %ld , %ld", &sw1, &sw2) != 2 ||
+    int payload_start = 0;
+    if (sscanf(line.c_str(), "+CRSM: %3ld , %3ld , %n", &sw1, &sw2, &payload_start) != 2 ||
+        payload_start == 0 ||
         !((sw1 == 144 && sw2 == 0) || (sw1 == 145 && sw2 >= 0 && sw2 <= 255))) return {};
-    std::string encoded = first_quoted(line);
-    if (encoded.size() != 20) return {};
+    // 必须是完整的二十半字节字段，不能从损坏的响应中截取可用子串。
+    std::string payload = idf_util_trim_copy(line.substr(payload_start));
+    if (payload.size() != 22 || payload.front() != '"' || payload.back() != '"') return {};
+    std::string encoded = payload.substr(1, 20);
 
     std::string value;
     value.reserve(encoded.size());
     for (size_t i = 0; i < encoded.size(); i += 2) {
         char low = static_cast<char>(toupper(static_cast<unsigned char>(encoded[i + 1])));
         char high = static_cast<char>(toupper(static_cast<unsigned char>(encoded[i])));
-        if ((!isdigit(static_cast<unsigned char>(low)) && low != 'F') ||
-            (!isdigit(static_cast<unsigned char>(high)) && high != 'F')) return {};
         value += low;
         value += high;
     }
-    if (!value.empty() && value.back() == 'F') value.pop_back();
-    for (char ch : value) if (!isdigit(static_cast<unsigned char>(ch))) return {};
-    return is_iccid_text(value) ? value : std::string();
+    return idf_normalize_iccid(value);
 }
 
 static std::string query_current_iccid(void)
@@ -1261,15 +1245,15 @@ static bool parse_http_url(const std::string& raw_url, std::string& protocol,
     return true;
 }
 
-static void normalize_keepalive_payload_size(std::string& protocol, const std::string& host,
-                                             std::string& path)
+static void normalize_keepalive_url(std::string& protocol, const std::string& host,
+                                    std::string& path)
 {
     if (host != "gg.incrafttime.top") return;
-    if (path == "/" || path == "/api/payload?size=128684" ||
-        path == "/api/payload?size=64342") {
-        // 内置站点 HTTP 已重定向到 HTTPS；首页是 HTML，不能用于下载保号。
+    // 内置首页使用默认下载；显式配置的路径和查询参数原样保留。
+    if (path == "/") path = "/api/payload?size=64342";
+    // 内置下载接口 HTTP 会重定向到 HTTPS，模组需直接请求 HTTPS。
+    if (path == "/api/payload" || starts_with(path, "/api/payload?")) {
         protocol = "https";
-        path = "/api/payload?size=64342";
     }
 }
 
@@ -1915,7 +1899,7 @@ static esp_err_t cellular_http_request_impl(const std::string& url, const char* 
     std::string path;
     if (!parse_http_url(url, protocol, host, path, result.message)) return ESP_ERR_INVALID_ARG;
     if (keepalive) {
-        normalize_keepalive_payload_size(protocol, host, path);
+        normalize_keepalive_url(protocol, host, path);
         append_no_cache_query(path);
     }
 

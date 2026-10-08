@@ -55,8 +55,11 @@ void xSemaphoreGiveRecursive(int) { --lock_depth; }
 bool wait_pdp_ready_locked(uint32_t, std::string& ip) { ip="10.2.3.4"; status_ip=ip; return pdp_ready; }
 // @结果结构@
 // @解析函数@
-bool fetch_mhttp_once_locked(const std::string&, const std::string&, const std::string&, const char*, const char*, const std::string&, uint32_t, IdfCellularHttpResult& r) {
+bool use_real_fetch=false;
+static bool real_fetch_mhttp_once_locked(const std::string&, const std::string&, const std::string&, const char*, const char*, const std::string&, uint32_t, IdfCellularHttpResult&);
+bool fetch_mhttp_once_locked(const std::string& protocol, const std::string& host, const std::string& path, const char* method, const char* type, const std::string& body, uint32_t minimum, IdfCellularHttpResult& r) {
     ++fetch_count;
+    if(use_real_fetch) return real_fetch_mhttp_once_locked(protocol,host,path,method,type,body,minimum,r);
     r.ok=fetch_ok;
     if(!fetch_ok) { r.mhttpError=1; r.message="DNS failure"; }
     return fetch_ok;
@@ -88,17 +91,6 @@ int main() {
         assert(wait_mhttp_download_locked(0,1000,48*1024,r,initial));
         assert(sms.size()==2 && sms[0]==sms_head && sms[1]==pdu);
     }
-    // 内置首页/历史 payload 升级到有效 HTTPS 下载；其它 URL 不变。
-    for(const char* legacy: {"/", "/api/payload?size=128684", "/api/payload?size=64342"}) {
-        std::string protocol="http", path=legacy;
-        normalize_keepalive_payload_size(protocol,"gg.incrafttime.top",path);
-        assert(protocol=="https" && path=="/api/payload?size=64342");
-    }
-    for(const char* host: {"example.com", "gg.incrafttime.top"}) {
-        std::string protocol="http", path="/custom?size=128684";
-        normalize_keepalive_payload_size(protocol,host,path);
-        assert(protocol=="http" && path=="/custom?size=128684");
-    }
     // 其它连接错误不污染本连接；短 payload 和超时提供可操作的原因。
     reset(); r={}; uart_data="+MHTTPURC: \"err\",3,1\r\n"+response;
     assert(wait_mhttp_download_locked(0,1000,48*1024,r,""));
@@ -116,6 +108,32 @@ int main() {
     assert(r.bytesRead==64342 && commands.back()=="AT+MHTTPDEL=0");
     // 数据原来关闭：成功、DNS 失败和 PDP 失败均应尝试关闭。
     IdfCellularHttpConfig cfg;
+    // 从运行入口到真实 AT 请求：只补缓存参数，不重写显式 payload 大小或查询顺序。
+    struct UrlCase { const char* url; const char* origin; const char* path; };
+    const UrlCase cases[] = {
+        {"http://gg.incrafttime.top/api/payload?size=128684", "https://gg.incrafttime.top", "/api/payload?size=128684"},
+        {"https://gg.incrafttime.top/api/payload?size=64342", "https://gg.incrafttime.top", "/api/payload?size=64342"},
+        {"http://gg.incrafttime.top/api/payload?size=1286840", "https://gg.incrafttime.top", "/api/payload?size=1286840"},
+        {"http://gg.incrafttime.top/api/payload?x=a%2Fb&size=100000&x=z", "https://gg.incrafttime.top", "/api/payload?x=a%2Fb&size=100000&x=z"},
+        {"http://gg.incrafttime.top/custom?size=128684", "http://gg.incrafttime.top", "/custom?size=128684"},
+        {"http://example.com/api/payload?size=128684", "http://example.com", "/api/payload?size=128684"},
+        {"http://example.com/gg.incrafttime.top/api/payload?size=128684", "http://example.com", "/gg.incrafttime.top/api/payload?size=128684"},
+        {"http://gg.incrafttime.top.evil.test/api/payload?size=128684", "http://gg.incrafttime.top.evil.test", "/api/payload?size=128684"},
+        {"http://gg.incrafttime.top/", "https://gg.incrafttime.top", "/api/payload?size=64342"},
+        {"", "https://gg.incrafttime.top", "/api/payload?size=64342"},
+    };
+    for(const auto& item: cases) {
+        reset(); use_real_fetch=true; request_reply=response;
+        assert(cellular_http_request_impl(item.url,"GET",nullptr,"",cfg,48*1024,true,r)==ESP_OK);
+        const std::string create="AT+MHTTPCREATE=\""+std::string(item.origin)+"\"";
+        std::string expected_path=item.path;
+        append_no_cache_query(expected_path);
+        const std::string request="AT+MHTTPREQUEST=0,1,0,"+hex_encode_ascii(expected_path);
+        assert(std::find(commands.begin(),commands.end(),create)!=commands.end());
+        assert(std::find(commands.begin(),commands.end(),request)!=commands.end());
+        assert(r.bytesRead==64342 && commands.back()=="AT+CGACT=0,1");
+        use_real_fetch=false;
+    }
     for(int scenario=0; scenario<3; ++scenario) {
         reset(); r={}; fetch_ok=scenario!=1; pdp_ready=scenario!=2;
         int ret=cellular_http_request_impl("http://example.com/payload","GET",nullptr,"",cfg,48*1024,true,r);

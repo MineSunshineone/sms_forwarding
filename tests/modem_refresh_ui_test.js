@@ -70,7 +70,14 @@ async function testInflightPollAndErrors() {
   assert.equal(b.context.modemSampleAwaitingResponse, false);
   assert.equal(b.context.statusLoading, false);
 }
+function testHexCredentialInput() {
+  const html = app().context.buildSimCredentials([{ iccid: '898600D6991330004146' }]);
+  assert.match(html, /name="sim0Iccid" inputmode="text"[^>]*value="898600D6991330004146"/);
+  assert.match(html, /name="sim0Pin" inputmode="numeric"/);
+  assert.match(html, /name="sim0Puk" inputmode="numeric"/);
+}
 (async () => {
+  testHexCredentialInput();
   await testQueuedAndComplete();
   await testInflightPollAndErrors();
   console.log('modem refresh UI regression tests passed');
