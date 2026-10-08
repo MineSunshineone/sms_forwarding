@@ -26,6 +26,8 @@ jobs:
       - name: Test modem refresh, schedules, and reply validation
         run: |
           python tools/test_modem_refresh.py
+          python tools/test_modem_uart.py
+          python tools/test_cellular_http.py
           python tools/test_daily_heartbeat.py
           python tools/test_scheduled_sms_health.py
           python tools/test_sched_persistence.py
