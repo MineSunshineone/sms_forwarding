@@ -83,8 +83,9 @@ void sample_cell_ip_once() {}
 void sample_signal_once() {}
 void sample_signal_detail_once() {}
 void set_phase(const char*) {}
-bool sample_identity_once(bool log_summary, bool network)
+bool sample_identity_once(bool log_summary, bool network, bool refresh_missing_phone)
 {
+    assert(refresh_missing_phone == log_summary);
     ++sampled;
     last_log_summary = log_summary;
     last_network = network;
