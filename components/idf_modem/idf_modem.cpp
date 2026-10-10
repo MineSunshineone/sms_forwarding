@@ -2077,7 +2077,8 @@ static void sample_signal_once(void)
     update_status(patch, false, true);
 }
 
-static bool sample_identity_once(bool log_summary = false, bool include_network_fields = true)
+static bool sample_identity_once(bool log_summary = false, bool include_network_fields = true,
+                                 bool refresh_missing_phone = false)
 {
     IdfModemStatus before = idf_modem_get_status();
     bool need_static = !s_identity_static_attempted ||
@@ -2131,9 +2132,11 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
             if (send_ok("AT+CGDCONT?", 1500, &resp)) patch.apnSim = parse_apn(resp);
             vTaskDelay(pdMS_TO_TICKS(150));
         }
-        if (before.phone.empty()) {
-            if (send_ok("AT+CNUM", 1500, &resp)) patch.phone = parse_cnum_phone(resp);
-        }
+    }
+    // 本机号码是可选字段：显式刷新允许补查一次，不受已读取运营商影响。
+    // 普通网页轮询不持续重试 CNUM；已读取的号码保留，换卡时由身份失效流程清除。
+    if (include_network_fields && before.phone.empty() && (need_network || refresh_missing_phone)) {
+        if (send_ok("AT+CNUM", 1500, &resp)) patch.phone = parse_cnum_phone(resp);
     }
 
     bool static_changed = (!patch.mfr.empty() && patch.mfr != before.mfr) ||
@@ -2167,9 +2170,10 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
     }
     save_identity_cache(patch.imei, patch.iccid);
     if (log_summary) {
-        idf_logf("模组信息采样完成：ICCID %s，运营商 %s；缺失字段将后台重试",
+        idf_logf("模组信息采样完成：ICCID %s，运营商 %s，本机号码 %s",
                  is_iccid_text(after.iccid) ? "已读取" : "未读到",
-                 after.operatorName.empty() ? "未读到" : "已读取");
+                 after.operatorName.empty() ? "未读到" : "已读取",
+                 after.phone.empty() ? "未读到，可手动设置或再次刷新" : "已读取");
     }
     return changed;
 }
@@ -2710,7 +2714,7 @@ static void modem_task(void*)
                 last_detail = now;
             }
             if (startup_sampling || force_sample || identity_retry_due) {
-                bool identity_changed = sample_identity_once(force_sample, sim_ready);
+                bool identity_changed = sample_identity_once(force_sample, sim_ready, force_sample);
                 last_identity = now;
                 if (startup_info_complete() || identity_changed) {
                     identity_retry_level = 0;

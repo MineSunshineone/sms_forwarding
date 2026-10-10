@@ -39,3 +39,25 @@ with tempfile.TemporaryDirectory(prefix='test-modem-', dir=ROOT / 'build') as te
                     '-I', str(ROOT / 'components/idf_config/include'),
                     str(cpp), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
+
+# 同时编译真实身份采样/状态更新/换卡函数，避免仅验证调度替身而漏掉 CNUM 条件。
+header = (ROOT / 'components/idf_modem/include/idf_modem.h').read_text()
+begin = header.index('struct IdfModemStatus {')
+end = header.index('\n};', begin) + 3
+phone_fixture = (ROOT / 'tests/modem_phone_refresh_test.cpp').read_text()
+phone_fixture = phone_fixture.replace('// @状态结构@', header[begin:end])
+phone_fixture = phone_fixture.replace('// @真实函数@', '\n\n'.join(function(name) for name in [
+    'is_imei_text(', 'is_imsi_text(', 'is_iccid_text(', 'update_status(',
+    'startup_info_complete(', 'reset_identity_sampling_state(', 'line_containing(',
+    'first_quoted(', 'parse_apn(', 'normalize_msisdn(', 'parse_cnum_phone(',
+    'sample_identity_once(',
+]))
+phone_fixture = phone_fixture.replace('// @换卡函数@', function('void idf_modem_invalidate_sim_identity('))
+with tempfile.TemporaryDirectory(prefix='test-phone-', dir=ROOT / 'build') as temp:
+    cpp = Path(temp) / 'test.cpp'
+    binary = Path(temp) / 'test'
+    cpp.write_text(phone_fixture)
+    subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
+                    '-I', str(ROOT / 'components/idf_config/include'),
+                    str(cpp), '-o', str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
