@@ -462,13 +462,14 @@ static esp_err_t handle_status(httpd_req_t* req)
 
     snprintf(buf, sizeof(buf),
              "\"dataEnabled\":%s,\"emailEnabled\":%s,\"emailConfigured\":%s,"
-             "\"pushEnabled\":%s,\"pushEnabledCount\":%d,\"apMode\":%s,",
+             "\"pushEnabled\":%s,\"pushEnabledCount\":%d,\"apMode\":%s,\"wifiConnected\":%s,",
              cfg.dataEnabled ? "true" : "false",
              cfg.emailEnabled ? "true" : "false",
              cfg.emailConfigured ? "true" : "false",
              cfg.pushEnabled ? "true" : "false",
              cfg.pushEnabledCount,
-             wifi.apMode ? "true" : "false");
+             wifi.apMode ? "true" : "false",
+             wifi.staConnected ? "true" : "false");
     body += buf;
 
     json_prop(body, "ssid", wifi.staConnected ? wifi.ssid : wifi.apSsid); body += ",";
